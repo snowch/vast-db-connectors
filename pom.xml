@@ -33,6 +33,14 @@
 <!--        <tag>375</tag>-->
 <!--    </scm>-->
 
+    <repositories>
+        <repository>
+            <id>github</id>
+            <name>GitHub Packages</name>
+            <url>https://maven.pkg.github.com/snowch/vast-db-connectors</url>
+        </repository>
+    </repositories>
+    
     <properties>
         <air.check.skip-spotbugs>true</air.check.skip-spotbugs>
         <air.check.skip-pmd>true</air.check.skip-pmd>
