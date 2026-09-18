@@ -115,10 +115,21 @@ Results (JDK 17, flags above), full module runs on the final tree: `spark35` 151
 (113 before the change + 38 new); `spark35-scala212` 150 tests, 0 failures (112 + 38; its
 `TestVastCatalog` has one test fewer). `ndb-common` (129) and `spark-common` (6) are unchanged and pass.
 
-## Not verified
+## Cluster verification
 
-I have no VAST cluster in this environment, so end-to-end behaviour is unverified by definition. What a
-maintainer should run, for a plain table and for a table with sorted columns (DEC128 row ids):
+The connector's unit tests cannot execute a write (the mock VAST server has no `QueryData`), so
+end-to-end behaviour was verified by the author's test run against a real VAST cluster (Spark 3.5.1),
+not by anything in this repository's test suite. Reported results, for a plain table and for a table
+with sorted columns (DEC128 row ids):
+
+* all 25 scenarios below pass on both tables, plus the string-key and partitioned-table checks
+  (8 more);
+* two 300k-row merges, one per table: 420,000 rows after the merge, 120,000 updated, 150,000
+  inserted, no deleted row left;
+* the only failures are the two unaliased-source cases noted under "Observed, not changed", which
+  fail the same way without this PR.
+
+The scenarios, so a maintainer can repeat them:
 
 ```sql
 CREATE TABLE ndb.b.s.tgt (k INT, v STRING, n INT);
@@ -198,10 +209,10 @@ UPDATE ndb.b.s.tgt SET n = n + 1 WHERE k = 2;
 -- and a MERGE whose *source* is such a table must see only what a SELECT sees.
 ```
 
-Also worth confirming on a cluster, because the mock server cannot: that the `UpdateRows` request
-built for MERGE updates (schema `[$row_id, c1 … cN]`, same as UPDATE today) is accepted for a DEC128
-row id table, and that a MERGE with an INSERT action on a partitioned table fails at analysis with
-"not supported on partitioned table" before any write happens.
+The two points the mock server could not cover are part of that run: the `UpdateRows` request built
+for MERGE updates (schema `[$row_id, c1 … cN]`, same as UPDATE today) was accepted on the sorted
+(DEC128 row id) table, and MERGE with an INSERT action on a partitioned table is refused at analysis
+("not supported on partitioned table") before any write happens.
 
 Things a maintainer should know:
 
@@ -223,6 +234,12 @@ Things a maintainer should know:
 * MERGE inserts on partitioned tables: the insert context already applies the partition transforms
   like a plain insert; what is missing is the clustered distribution `VastPartitionedWriteBuilder`
   requests, which needs a cluster to validate.
+* Table-name qualifiers for relations the connector resolves itself (`SELECT src.v FROM ndb.b.s.src`,
+  an unaliased MERGE source, unaliased DELETE/UPDATE targets): wrap the relation
+  `NDBTablesResolutionRule` resolves in `SubqueryAlias(<table>, <catalog.namespace>)` above the
+  row-filter/column-mask wrappers, as Spark's own table lookup does. Separate PR with its own tests
+  (SELECT, joins, views, filtered/masked tables, DELETE/UPDATE); this PR's parser-level target alias
+  becomes redundant then and can be removed there.
 * `spark34`, Trino.
 
 ## Observed, not changed
