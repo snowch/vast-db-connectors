@@ -111,8 +111,8 @@ New tests (TestNG, no cluster; the mock VAST server has no `QueryData`, so nothi
   `NDBCommon.vastClient` is a static singleton that `clearConfig()` does not reset, so only one mock
   server port works per JVM (same reason the existing DELETE/UPDATE analysis tests are there).
 
-Results (JDK 17, flags above), full module runs on the final tree: `spark35` 148 tests, 0 failures
-(113 before the change + 35 new); `spark35-scala212` 147 tests, 0 failures (112 + 35; its
+Results (JDK 17, flags above), full module runs on the final tree: `spark35` 151 tests, 0 failures
+(113 before the change + 38 new); `spark35-scala212` 150 tests, 0 failures (112 + 38; its
 `TestVastCatalog` has one test fewer). `ndb-common` (129) and `spark-common` (6) are unchanged and pass.
 
 ## Not verified
