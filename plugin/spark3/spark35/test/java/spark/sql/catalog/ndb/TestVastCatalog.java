@@ -65,8 +65,10 @@ import org.apache.spark.sql.catalyst.expressions.ExprId;
 import org.apache.spark.sql.catalyst.parser.ParseException;
 import org.apache.spark.sql.catalyst.plans.logical.AppendData;
 import org.apache.spark.sql.catalyst.plans.logical.ColumnStat;
+import org.apache.spark.sql.catalyst.plans.logical.Filter;
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
 import org.apache.spark.sql.catalyst.plans.logical.MergeRows;
+import org.apache.spark.sql.catalyst.plans.logical.Project;
 import org.apache.spark.sql.catalyst.plans.logical.Statistics;
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias;
 import org.apache.spark.sql.catalyst.plans.logical.WriteDelta;
@@ -3074,18 +3076,8 @@ public class TestVastCatalog
             RowColumnSecurityResponse rowColumnSecurityResponse)
             throws VastUserException
     {
-        CatalogPlugin ndb = session.sessionState().catalogManager().catalog("ndb");
-        VastCatalog vastCatalog = (VastCatalog) ndb;
-        VastConfig vastConfig = NDB.getConfig();
-        VastClient vastClient = NDB.getVastClient(vastConfig);
-        VastCatalogTestUtils vastCatalogTestUtils = new VastCatalogTestUtils(
-                vastConfig, vastClient,
-                VastSparkTransactionsManager.getInstance(vastClient,
-                        new VastTransactionFactory()));
-        vastCatalogTestUtils.setRowColumnsSecurityResponse("buck/schem", table,
-                rowColumnSecurityResponse);
-        vastCatalog.setVastCatalogUtils(vastCatalogTestUtils);
-        InitializedVastCatalog.setVastCatalog(vastCatalog);
+        connectorResolution(session).setRowColumnsSecurityResponse("buck/schem",
+                table, rowColumnSecurityResponse);
     }
 
     @Test
@@ -3128,27 +3120,19 @@ public class TestVastCatalog
 
     // On a real cluster VastCatalog.loadTable treats an empty, non-null masked-columns map as
     // row/column security, so Spark's own ResolveRelations never resolves a VAST relation:
-    // NDBTablesResolutionRule does, and returns a bare DataSourceV2Relation with no alias.
-    // VastCatalogTestUtils answers such an empty response for every table, which reproduces
-    // that path on the mock server.
+    // NDBTablesResolutionRule does, and aliases it with its table name like Spark would (see the
+    // relation alias tests below). VastCatalogTestUtils answers such an empty response for every
+    // table, which reproduces that path on the mock server.
     @Test
     public void testMergeUnaliasedTargetResolvedByConnector()
             throws VastUserException
     {
         try (SparkSession session = SparkTestUtils.getSession(testPort)) {
             createMergeTables(session);
-            setMergeTargetSecurity(session, "tgt", new RowColumnSecurityResponse(
-                    ImmutableList.of(), ImmutableSet.of(), ImmutableSet.of(),
-                    ImmutableMap.of()));
-            LogicalPlan select = analyzePlan(session, "SELECT * FROM " + MERGE_TARGET);
-            java.util.List<LogicalPlan> aliases = new ArrayList<>();
-            select.foreach(node -> {
-                if (node instanceof SubqueryAlias) {
-                    aliases.add(node);
-                }
-                return null;
-            });
-            assertTrue(aliases.isEmpty(), "expected the connector's bare relation: " + select);
+            connectorResolution(session);
+            SubqueryAlias alias = connectorAlias(
+                    analyzePlan(session, "SELECT * FROM " + MERGE_TARGET), "tgt");
+            assertTrue(alias.child() instanceof DataSourceV2Relation, "under the alias: " + alias);
 
             WriteDelta writeDelta = analyzeRowLevel(session,
                     "MERGE INTO " + MERGE_TARGET + " USING " + MERGE_SOURCE + " s ON tgt.k = s.k " +
@@ -3283,6 +3267,322 @@ public class TestVastCatalog
             assertFalse(rowLevelVastTable(update).getTableMD().isForMerge());
             assertEquals(fieldNames(update.projections().rowProjection().get().schema()),
                     java.util.List.of(SPARK_INT64_ROW_ID_FIELD.name(), "k", "v"));
+        }
+    }
+
+    // ---- Relations resolved by the connector carry their table name as an alias ----
+    //
+    // Spark's ResolveRelations aliases every relation it resolves with `catalog.namespace.table`.
+    // NDBTablesResolutionRule, which resolves a VAST relation whenever VastCatalog.loadTable
+    // refuses the RCLS-suffixed lookup (a real cluster), used to return the bare relation, so
+    // `table.column` references did not resolve. The tests below run on that path unless they
+    // say otherwise; the row/column security policy for DELETE / UPDATE / MERGE is unchanged.
+
+    private static final String FILTERED_TARGET = MERGE_TARGET + "_filtered";
+    private static final String MASKED_TARGET = MERGE_TARGET + "_masked";
+
+    private static RowColumnSecurityResponse rowFilter()
+    {
+        return new RowColumnSecurityResponse(ImmutableList.of("k > 10"),
+                ImmutableSet.of(), ImmutableSet.of(), ImmutableMap.of());
+    }
+
+    private static RowColumnSecurityResponse columnMask()
+    {
+        return new RowColumnSecurityResponse(ImmutableList.of(), ImmutableSet.of(),
+                ImmutableSet.of(), ImmutableMap.of("v", "regexp_replace(v, '[0-9]', '***')"));
+    }
+
+    // Installs VastCatalogTestUtils, which answers an empty, non-null row/column security
+    // response for every table: VastCatalog.loadTable then refuses every RCLS-suffixed lookup
+    // and NDBTablesResolutionRule resolves the relations, as on a real cluster
+    private VastCatalogTestUtils connectorResolution(SparkSession session)
+            throws VastUserException
+    {
+        VastCatalog vastCatalog = (VastCatalog) session
+                .sessionState()
+                .catalogManager()
+                .catalog("ndb");
+        VastConfig vastConfig = NDB.getConfig();
+        VastClient vastClient = NDB.getVastClient(vastConfig);
+        VastCatalogTestUtils vastCatalogTestUtils = new VastCatalogTestUtils(
+                vastConfig, vastClient,
+                VastSparkTransactionsManager.getInstance(vastClient,
+                        new VastTransactionFactory()));
+        vastCatalog.setVastCatalogUtils(vastCatalogTestUtils);
+        InitializedVastCatalog.setVastCatalog(vastCatalog);
+        return vastCatalogTestUtils;
+    }
+
+    private static java.util.List<SubqueryAlias> aliasesIn(LogicalPlan plan)
+    {
+        java.util.List<SubqueryAlias> aliases = new ArrayList<>();
+        plan.foreach(node -> {
+            if (node instanceof SubqueryAlias) {
+                aliases.add((SubqueryAlias) node);
+            }
+            return null;
+        });
+        return aliases;
+    }
+
+    private static java.util.List<String> qualifierOf(SubqueryAlias alias)
+    {
+        java.util.List<String> parts = new ArrayList<>();
+        Seq<String> qualifier = alias.identifier().qualifier();
+        for (int i = 0; i < qualifier.size(); i++) {
+            parts.add(qualifier.apply(i));
+        }
+        return parts;
+    }
+
+    private static SubqueryAlias aliasNamed(LogicalPlan plan, String name)
+    {
+        for (SubqueryAlias alias : aliasesIn(plan)) {
+            if (alias.alias().equals(name)) {
+                return alias;
+            }
+        }
+        throw new AssertionError("no alias " + name + " in " + plan);
+    }
+
+    // the alias a resolved VAST relation carries: its plain table name, qualified by the catalog
+    // and the namespace, exactly as Spark's ResolveRelations aliases a relation
+    private static SubqueryAlias connectorAlias(LogicalPlan plan, String table)
+    {
+        SubqueryAlias alias = aliasNamed(plan, table);
+        assertEquals(qualifierOf(alias), java.util.List.of("ndb", "buck", "schem"),
+                "qualifier of " + alias);
+        return alias;
+    }
+
+    @Test
+    public void testConnectorResolvedRelationIsAliasedWithItsTableName()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            connectorResolution(session);
+            LogicalPlan select = analyzePlan(session,
+                    "SELECT tgt.k, schem.tgt.v, buck.schem.tgt.k, ndb.buck.schem.tgt.v " +
+                            "FROM " + MERGE_TARGET + " WHERE tgt.k > 0");
+            assertEquals(outputNames(select), java.util.List.of("k", "v", "k", "v"));
+            assertEquals(aliasesIn(select).size(), 1, "aliases in " + select);
+            SubqueryAlias alias = connectorAlias(select, "tgt");
+            assertTrue(alias.child() instanceof DataSourceV2Relation, "under the alias: " + alias);
+            DataSourceV2Relation relation = (DataSourceV2Relation) alias.child();
+            // the lookup suffixes are gone from the relation identifier as well
+            assertEquals(relation.identifier().get().name(), "tgt");
+            assertEquals(outputNames(relation), java.util.List.of("k", "v"));
+            // a relative name resolves to the same alias
+            session.sql("USE ndb.buck.schem").show();
+            connectorAlias(analyzePlan(session, "SELECT tgt.k FROM tgt"), "tgt");
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedJoinByTableNames()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            connectorResolution(session);
+            LogicalPlan join = analyzePlan(session,
+                    "SELECT tgt.k, src.v, src.op FROM " + MERGE_TARGET + " JOIN " + MERGE_SOURCE +
+                            " ON tgt.k = src.k WHERE src.op <> 'D'");
+            assertEquals(outputNames(join), java.util.List.of("k", "v", "op"));
+            connectorAlias(join, "tgt");
+            connectorAlias(join, "src");
+            // a user alias sits above the connector's alias and hides the table name
+            LogicalPlan selfJoin = analyzePlan(session,
+                    "SELECT a.k, b.v FROM " + MERGE_TARGET + " a JOIN " + MERGE_TARGET + " b ON a.k = b.k");
+            assertEquals(aliasesIn(selfJoin).size(), 4, "aliases in " + selfJoin);
+            assertTrue(aliasNamed(selfJoin, "a").child() instanceof SubqueryAlias,
+                    "under alias a: " + aliasNamed(selfJoin, "a"));
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "SELECT tgt.k FROM " + MERGE_TARGET + " a JOIN " + MERGE_TARGET + " b ON a.k = b.k"))
+                    .isInstanceOf(AnalysisException.class);
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedFilteredAndMaskedRelationsKeepTheirWrappersUnderTheAlias()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            VastCatalogTestUtils utils = connectorResolution(session);
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_filtered", rowFilter());
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_masked", columnMask());
+            SubqueryAlias filtered = connectorAlias(analyzePlan(session,
+                    "SELECT tgt_filtered.k FROM " + FILTERED_TARGET + " WHERE tgt_filtered.k < 100"),
+                    "tgt_filtered");
+            assertTrue(filtered.child() instanceof Filter, "under the alias: " + filtered);
+            Filter filter = (Filter) filtered.child();
+            assertTrue(filter.condition().toString().contains("> 10"), "row filter: " + filter);
+            assertTrue(filter.child() instanceof DataSourceV2Relation, "under the filter: " + filter);
+            SubqueryAlias masked = connectorAlias(analyzePlan(session,
+                    "SELECT tgt_masked.v FROM " + MASKED_TARGET), "tgt_masked");
+            assertTrue(masked.child() instanceof Project, "under the alias: " + masked);
+            Project mask = (Project) masked.child();
+            assertTrue(mask.projectList().apply(1).toString().contains("regexp_replace"),
+                    "column mask: " + mask);
+            assertTrue(mask.child() instanceof DataSourceV2Relation, "under the mask: " + mask);
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedDeleteAndUpdateByTableName()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            connectorResolution(session);
+            for (String where : new String[] {"k = 1", "tgt.k = 1", "schem.tgt.k = 1"}) {
+                WriteDelta delete = analyzeRowLevel(session,
+                        "DELETE FROM " + MERGE_TARGET + " WHERE " + where, RowLevelDelete.class);
+                assertEquals(fieldNames(delete.projections().rowIdProjection().schema()),
+                        java.util.List.of(SPARK_INT64_ROW_ID_FIELD.name()));
+                WriteDelta update = analyzeRowLevel(session,
+                        "UPDATE " + MERGE_TARGET + " SET v = concat(tgt.v, 'x') WHERE " + where,
+                        RowLevelUpdate.class);
+                assertEquals(fieldNames(update.projections().rowProjection().get().schema()),
+                        java.util.List.of(SPARK_INT64_ROW_ID_FIELD.name(), "k", "v"));
+            }
+            // a user alias still works, and hides the table name
+            analyzeRowLevel(session, "DELETE FROM " + MERGE_TARGET + " AS t WHERE t.k = 1",
+                    RowLevelDelete.class);
+            analyzeRowLevel(session, "UPDATE " + MERGE_TARGET + " AS t SET v = 'x' WHERE t.k = 1",
+                    RowLevelUpdate.class);
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "DELETE FROM " + MERGE_TARGET + " AS t WHERE tgt.k = 1"))
+                    .isInstanceOf(AnalysisException.class);
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedRowLevelSecurityPolicyIsUnchangedByTheAlias()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            VastCatalogTestUtils utils = connectorResolution(session);
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_filtered", rowFilter());
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_masked", columnMask());
+            // the row filter is merged into the delete condition, with or without a qualifier
+            for (String where : new String[] {"k = 1", "tgt_filtered.k = 1"}) {
+                WriteDelta delete = analyzeRowLevel(session,
+                        "DELETE FROM " + FILTERED_TARGET + " WHERE " + where, RowLevelDelete.class);
+                String condition = delete.condition().toString();
+                assertTrue(condition.contains("= 1") && condition.contains("> 10"),
+                        "delete condition: " + condition);
+            }
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "UPDATE " + FILTERED_TARGET + " SET v = 'x' WHERE tgt_filtered.k = 1"))
+                    .isInstanceOf(VastRuntimeException.class)
+                    .hasMessageContaining("Update table is not allowed by current VAST security policy rules");
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "DELETE FROM " + MASKED_TARGET + " WHERE tgt_masked.k = 1"))
+                    .isInstanceOf(VastRuntimeException.class)
+                    .hasMessageContaining("Delete from table is not allowed by current VAST security policy rules");
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "UPDATE " + MASKED_TARGET + " SET v = 'x' WHERE tgt_masked.k = 1"))
+                    .isInstanceOf(VastRuntimeException.class)
+                    .hasMessageContaining("Update table is not allowed by current VAST security policy rules");
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "MERGE INTO " + FILTERED_TARGET + " USING " + MERGE_SOURCE + " ON tgt_filtered.k = src.k " +
+                            "WHEN MATCHED THEN DELETE"))
+                    .isInstanceOf(VastRuntimeException.class)
+                    .hasMessageContaining("Merge into table is not allowed by current VAST security policy rules");
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedMergeSourceAndTargetByTableName()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            connectorResolution(session);
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + MERGE_TARGET + " t USING " + MERGE_SOURCE + " ON t.k = src.k " +
+                            "WHEN MATCHED AND src.op = 'D' THEN DELETE " +
+                            "WHEN MATCHED THEN UPDATE SET v = src.v " +
+                            "WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.v)",
+                    RowLevelMerge.class));
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + MERGE_TARGET + " USING " + MERGE_SOURCE + " ON tgt.k = src.k " +
+                            "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+                    RowLevelMerge.class));
+            // insert-only merges and plain inserts keep their bare target, the source is aliased
+            for (String insert : new String[] {
+                    "MERGE INTO " + MERGE_TARGET + " USING " + MERGE_SOURCE + " ON tgt.k = src.k " +
+                            "WHEN NOT MATCHED THEN INSERT *",
+                    "INSERT INTO " + MERGE_TARGET + " SELECT src.k, src.v FROM " + MERGE_SOURCE}) {
+                LogicalPlan analyzed = analyzePlan(session, insert);
+                assertTrue(analyzed instanceof AppendData, "analyzed plan: " + analyzed);
+                AppendData append = (AppendData) analyzed;
+                assertTrue(append.table() instanceof DataSourceV2Relation, "target: " + append.table());
+                assertTrue(((DataSourceV2Relation) append.table()).table() instanceof VastTable);
+                connectorAlias(append.query(), "src");
+            }
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedViewQueryCanUseTableNames()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            connectorResolution(session);
+            String viewQuery = "SELECT tgt.k AS key, tgt.v FROM " + MERGE_TARGET + " WHERE tgt.k > 0";
+            StructType viewSchema = new StructType(new StructField[] {
+                    new StructField("key", DataTypes.IntegerType, true, Metadata.empty()),
+                    new StructField("v", DataTypes.StringType, true, Metadata.empty())});
+            when(mockViewMetadataReader.getVastView(
+                    nullable(SimpleVastTransaction.class), nullable(String.class),
+                    nullable(String.class), nullable(String[].class), anyList(),
+                    nullable(VastSchedulingInfo.class), nullable(String.class)))
+                    .thenReturn(new VastView("v1", viewQuery, "ndb", "",
+                            new String[] {"buck", "schem"}, viewSchema, new String[0],
+                            new String[0], new String[0]));
+            when(mockViewMetadataReaderFactory.instance()).thenReturn(mockViewMetadataReader);
+            VastCatalog vastCatalog = (VastCatalog) session
+                    .sessionState()
+                    .catalogManager()
+                    .catalog("ndb");
+            vastCatalog.setSparkViewsMetadataReaderFactory(mockViewMetadataReaderFactory);
+            // the view definition is analyzed on creation, and again on every use
+            session.sql("CREATE VIEW ndb.buck.schem.v1 AS " + viewQuery).show();
+            LogicalPlan select = analyzePlan(session,
+                    "SELECT v1.key, v1.v FROM ndb.buck.schem.v1 WHERE v1.key = 1");
+            assertEquals(outputNames(select), java.util.List.of("key", "v"));
+            SubqueryAlias view = aliasNamed(select, "v1");
+            connectorAlias(view.child(), "tgt");
+        }
+    }
+
+    // Without row/column security answers (the default on the mock server) Spark resolves the
+    // relation itself and aliases it with the lookup identifier, which carries the resolution
+    // suffixes: NDBRCLSResolvedRelationAdaptorRule restores the plain table name.
+    @Test
+    public void testSparkResolvedRelationsByTableName()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            SubqueryAlias alias = connectorAlias(
+                    analyzePlan(session, "SELECT * FROM " + MERGE_TARGET), "tgt");
+            assertTrue(alias.child() instanceof DataSourceV2Relation, "under the alias: " + alias);
+            analyzeRowLevel(session, "DELETE FROM " + MERGE_TARGET + " WHERE tgt.k = 1",
+                    RowLevelDelete.class);
+            analyzeRowLevel(session,
+                    "UPDATE " + MERGE_TARGET + " SET v = concat(tgt.v, 'x') WHERE tgt.k = 1",
+                    RowLevelUpdate.class);
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + MERGE_TARGET + " USING " + MERGE_SOURCE + " ON tgt.k = src.k " +
+                            "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+                    RowLevelMerge.class));
         }
     }
 }

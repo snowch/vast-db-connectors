@@ -69,6 +69,7 @@ import static ndb.SparkPlannerUtil.newDataSourceV2Relation;
 import static ndb.SparkPlannerUtil.removeRowLevelOpSuffixFromNameSeq;
 import static ndb.SparkPlannerUtil.removeVastResolutionSuffixes;
 import static spark.sql.catalog.ndb.NDBRowLevelOperationIdentifier.isForRowLevelOp;
+import static spark.sql.catalog.ndb.NDBRowLevelOperationIdentifier.trimTableNameFromRowLevelOpSuffix;
 
 public class NDBTablesResolutionRule
         extends Rule<LogicalPlan>
@@ -264,7 +265,9 @@ public class NDBTablesResolutionRule
                             uRelName, e);
                     try {
                         if (ifRCLSName(uRelName.last())) {
-                            return resolveRCLSTableScanPlan(uRelName,
+                            return aliasedWithTableName(
+                                    resolveRCLSTableScanPlan(uRelName,
+                                            currentNamespace), uRelName,
                                     currentNamespace);
                         }
                         else {
@@ -455,6 +458,31 @@ public class NDBTablesResolutionRule
         VastTable table = (VastTable) getVastCatalog().loadTable(
                 Identifier.of(namespace, adaptedName));
         return wrapLogicalPlanWithRCLSNodes(table, namespace, name);
+    }
+
+    // Spark's ResolveRelations aliases every relation it resolves with the catalog, the
+    // namespace and the table name. A relation resolved here gets the same alias, so that
+    // `table.column` references resolve against it; the alias sits above the row filter /
+    // column mask wrappers, as it does for a view.
+    private SubqueryAlias aliasedWithTableName(LogicalPlan plan,
+            Seq<String> uRelName, String[] currentNamespace)
+    {
+        String[] namespace = new VastNamespaceResolver().apply(uRelName,
+                currentNamespace);
+        String lookupName = uRelName.last();
+        String tableName = trimTableNameFromRowLevelOpSuffix(
+                lookupName.substring(0,
+                        lookupName.length() - VAST_THROW_RCLS_ERROR.length()));
+        Builder<String, List<String>> qualifierBuilder = List$.MODULE$.newBuilder();
+        qualifierBuilder.$plus$eq(getVastCatalog().name());
+        for (String part : namespace) {
+            qualifierBuilder.$plus$eq(part);
+        }
+        SubqueryAlias aliased = new SubqueryAlias(
+                new AliasIdentifier(tableName, qualifierBuilder.result()), plan);
+        LOG.debug("Returning resolved table plan with subquery alias {}",
+                aliased);
+        return aliased;
     }
 
     private LogicalPlan wrapLogicalPlanWithRCLSNodes(VastTable table,

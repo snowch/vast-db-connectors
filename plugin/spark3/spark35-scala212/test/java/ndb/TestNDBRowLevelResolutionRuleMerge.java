@@ -223,10 +223,10 @@ public class TestNDBRowLevelResolutionRuleMerge
         assertSame(resolved.sourceTable(), source);
     }
 
-    // Shape of a target resolved by the connector (NDBTablesResolutionRule returns a bare
-    // relation) under the alias the parser adds for an unaliased target
+    // Shape of a target resolved by the connector: NDBTablesResolutionRule aliases the relation
+    // with its plain table name, there is nothing to clean up
     @Test
-    public void testConnectorResolvedTargetKeepsParserAlias()
+    public void testConnectorResolvedTargetKeepsItsAlias()
     {
         DataSourceV2Relation relation = newDataSourceV2Relation(int64Table(), null,
                 NAMESPACE, "tgt");
