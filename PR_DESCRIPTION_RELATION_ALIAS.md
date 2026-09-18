@@ -159,11 +159,41 @@ and the same for `plugin/spark3/spark35-scala212`.
 
 Checkstyle runs in the same build and passes.
 
-## Not verified — needs a cluster
+## Cluster verification
 
-Nothing here executed against VAST. The mock server has no `QueryData`, so every test stops at
-analysis. Things a maintainer should run on a cluster, on a table with row/column security enabled
-for the session (the connector path) and on one without:
+Run in a second session against a real cluster (VAST 5.5.0.1, Spark 3.5.1 `local[2]`, JDK 11; the
+`spark35` build of this branch at 6c19016 and of the MERGE branch at bd08870), not by anything in
+this repository's test suite. The mock-server tests above stop at analysis.
+
+* The MERGE PR's full regression on this branch: 27/27 on the plain and on the sorted table (the
+  25 earlier checks plus the two unaliased-source MERGEs, which now pass), the string-key and
+  partitioned checks, the 50k-row ANSI CAST failure (table unchanged), explicit-transaction commit
+  and rollback, and the 300k/300k upserts on both tables (420,000 rows, 120,000 updated, 150,000
+  inserted, no deleted key left).
+* The table-name statements below: 13/13 on this branch, with row counts and values checked after
+  every write. On the MERGE branch every table-qualified form fails with `UNRESOLVED_COLUMN`, and
+  the view is not created (see "Observed"); `SELECT a.k, b.v … a JOIN … b` and
+  `DELETE … WHERE k = 4` behave the same on both.
+* Row/column security, on both branches, the session running as a restricted user (no
+  impersonation) with a row filter `k > 10` on `tgt_f`, a column mask
+  `regexp_replace(v, '[0-9]', '***')` on `tgt_m` and a column deny on `v` of `tgt_d`, an admin
+  read-back after every statement and the visible rows restored between DELETEs: **no hidden row
+  or value was read, deleted or updated on either branch**, and every form that resolves on both
+  branches gives the same outcome. On this branch: SELECT sees only `k > 10` / masked `v`, with
+  and without qualifiers; DELETE on `tgt_f` unqualified, table-qualified and `AS t` removes only
+  visible rows (`AS t WHERE t.k <= 10` deletes nothing, `WHERE k = 5 OR k = 11` deletes only 11);
+  UPDATE on `tgt_f`, DELETE and UPDATE on `tgt_m`, MERGE into either, with and without aliases,
+  are refused with the existing messages; a MERGE source `tgt_f`, unaliased or aliased, updates
+  and inserts nothing from the hidden rows, a subquery source matches only `k > 10`, a source
+  `tgt_m` writes the masked values, a subquery source filtering on the raw value of the masked
+  column matches nothing. The denied column is not exposed (`SELECT *` returns the other columns,
+  `tgt_d.v` is unresolved, UPDATE/MERGE assigning it fail at analysis); a DELETE on the column-deny
+  table fails at run time with the server's 403, nothing deleted (see "Observed").
+
+Not verified on a cluster: the `spark35-scala212` build, and the end-user impersonation path
+(`spark.ndb.enable_end_user_impersonation`).
+
+The table-name statements, as run (`tgt` starts as `k = 1..5`, `src = (2,B,2),(3,C,3),(4,d,40)`):
 
 ```sql
 -- SELECT / joins
@@ -181,10 +211,6 @@ MERGE INTO ndb.b.s.tgt t USING ndb.b.s.src ON t.k = src.k
   WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.v);
 MERGE INTO ndb.b.s.tgt USING ndb.b.s.src ON tgt.k = src.k
   WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;
--- row filter on tgt_f (e.g. k > 10): the DELETE must only touch rows the filter lets through
-DELETE FROM ndb.b.s.tgt_f WHERE tgt_f.k < 100;   -- then count the rows with k <= 10: unchanged
-UPDATE ndb.b.s.tgt_f SET v = 'x' WHERE tgt_f.k = 1;   -- refused
--- column mask on tgt_m: DELETE and UPDATE refused, SELECT tgt_m.v returns the masked value
 -- INSERT unchanged
 INSERT INTO ndb.b.s.tgt SELECT src.k, src.v FROM ndb.b.s.src;
 -- a view with table-qualified columns
@@ -192,15 +218,12 @@ CREATE VIEW ndb.b.s.v1 AS SELECT tgt.k AS key, tgt.v FROM ndb.b.s.tgt WHERE tgt.
 SELECT v1.key FROM ndb.b.s.v1 WHERE v1.key = 1;
 ```
 
-The MERGE PR's own checklist should be re-run as well, since its target alias now comes from the
-resolution rule instead of the parser.
+### Row/column security statements
 
-### Row/column security on a cluster
-
-Neither PR has been run against a cluster with security policies. The mock-server tests pin the
-*plan shapes* (filter merged into the DELETE condition, refusals, wrappers on the source side);
-what only a cluster can show is the resulting rows. Setup, following the VAST "Row and Column
-Security" guide: an identity policy for a restricted user with a `RowColumnSecurity` statement on
+The mock-server tests pin the *plan shapes* (filter merged into the DELETE condition, refusals,
+wrappers on the source side); the cluster run above checked the resulting rows. Setup, following
+the VAST "Row and Column Security" guide: an identity policy for a restricted user with a
+`RowColumnSecurity` statement on
 `b/s/tgt_f` (`RowFilter` `{"QueryEngine": ["Spark"], "FilterString": "k > 10"}`) and one on
 `b/s/tgt_m` (`ColumnMask` `{"QueryEngine": ["Spark"], "ColumnName": "v", "MaskString":
 "regexp_replace(v, '[0-9]', '***')"}`); `s3:TabularGetRowColumnSecurity` allowed for the
@@ -210,9 +233,9 @@ Spark session either running with the restricted user's credentials, or with
 (`s3:TabularEndUserImpersonation` allowed). Tables: `tgt_f` and `tgt_m` `(k INT, v STRING)` with
 rows on both sides of `k = 10`, `src (k INT, v STRING, op STRING)`, `tgt` as in the MERGE PR.
 
-Expected, as the restricted user, on both PR branches (the MERGE branch has the bare relation, so
-the table-qualified forms fail there with `UNRESOLVED_COLUMN`; the outcomes of the forms that do
-resolve must be the same on both):
+As run by the restricted user on both branches, with the outcomes in the comments confirmed
+(the MERGE branch has the bare relation, so the table-qualified forms fail there with
+`UNRESOLVED_COLUMN`; the tester added an aliased twin of each, which behaves the same on both):
 
 ```sql
 -- SELECT sees only k > 10 on tgt_f, masked v on tgt_m, qualified or not
@@ -240,8 +263,8 @@ MERGE INTO ndb.b.s.tgt t USING (SELECT * FROM ndb.b.s.tgt_f) s ON t.k = s.k WHEN
 ```
 
 Column allow/deny policies are read by the connector (`ParsedRowColumnSecurity`) but produce no
-plan wrapper, so the alias does not interact with them; a quick `SELECT` of a denied column as the
-restricted user, before and after, is still worth a look.
+plan wrapper, so the alias does not interact with them; the cluster run confirmed the denied
+column stays unexposed on both branches.
 
 ## Follow-ups (not in this PR)
 
@@ -256,9 +279,16 @@ restricted user, before and after, is still worth a look.
   returns the plain `UnresolvedRelation` when its own lookups fail, and the adaptor's DELETE branch
   then throws a GENERAL "Unexpected child class" `VastRuntimeException` in the same iteration,
   before Spark can resolve the relation. This PR keeps that path exactly as it was.
-* `CREATE VIEW` analyses the view query with `Analyzer.execute` and no `checkAnalysis`, so a view
-  whose query does not resolve is created anyway; the first SELECT on it fails with
-  `TABLE_OR_VIEW_NOT_FOUND`, because the tables rule swallows the view-query analysis error and
-  falls back to a table lookup. Seen in the before-run of the view test (the query used `tgt.k`).
+* `CREATE VIEW` analyses the view query with `Analyzer.execute` and no `checkAnalysis`. On the
+  mock server a view whose query does not resolve is created anyway and the first SELECT on it
+  fails with `TABLE_OR_VIEW_NOT_FOUND`, because the tables rule swallows the view-query analysis
+  error and falls back to a table lookup (seen in the before-run of the view test); on the cluster
+  the MERGE branch reported success for the same `CREATE VIEW` and no view existed afterwards.
+  Same on both branches; this PR only makes such a query resolve.
+* DML on a table with a column-deny policy is not refused by the connector: a DELETE fails at run
+  time with the server's 403 ("failed to delete rows, some columns are not allowed"), nothing
+  deleted; an UPDATE or MERGE assigning the denied column fails at analysis because the column is
+  not exposed. Safe, but unlike row filters and masks there is no connector-level refusal message.
+  Same on both branches.
 * The `UnresolvedTableOrView` path of `NDBTablesResolutionRule.resolveRCLSTableScanPlan` still
   returns a bare relation; it is only reachable with a literally RCLS-suffixed name.
