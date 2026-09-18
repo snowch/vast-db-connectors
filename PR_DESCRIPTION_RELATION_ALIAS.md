@@ -1,6 +1,6 @@
 # Spark 3.5: alias the VAST relations the connector resolves with their table name
 
-Branch `claude/vast-relation-alias`, stacked on the MERGE INTO branch (`claude/zealous-davinci-6ptnat`).
+Branch `claude/connector-table-qualifiers`, stacked on the MERGE INTO branch (`claude/zealous-davinci-6ptnat`).
 Both trees, `spark35` and `spark35-scala212`.
 
 ## What and why
@@ -47,6 +47,28 @@ qualifiers all the time, so this matters for the migration story as much as MERG
    is aliased by whichever rule resolves it. `NDBRowLevelResolutionRule` still cleans the suffixed
    alias on the Spark path.
 
+**Row/column security.** Today a DELETE on a row-filtered table is allowed with the filter ANDed
+into the DELETE condition, a DELETE on a column-masked table is refused, UPDATE and MERGE are
+refused on either. The alias must not be able to hide a wrapper from that logic, so the invariant
+is: *look through every alias first, then decide on what is underneath, in one application of the
+rule.* `NDBRCLSResolvedRelationAdaptorRule` runs in the same Resolution-batch iteration as
+`NDBTablesResolutionRule`, after it, so it sees the wrappers the moment they exist, and before
+Spark's `RewriteDeleteFromTable` / `RewriteUpdateTable` / `RewriteMergeIntoTable` (which run
+earlier in the next iteration) can rewrite anything:
+
+* DELETE: `EliminateSubqueryAliases(target)` is a `Project` → refuse; a `Filter` → its condition
+  is ANDed into the DELETE condition and the `Filter` node removed from the plan, every alias
+  above it kept; a relation → nothing to do (Spark eliminates the alias itself in the rewrite).
+* UPDATE: unchanged — looks through the aliases, refuses `Project` or `Filter`.
+* MERGE: unchanged — unwraps the marker and the aliases, refuses `Project` or `Filter`.
+
+The old DELETE branch removed a `SubqueryAlias` in one application and handled the wrapper it
+uncovered in a later fixed-point iteration. That was safe only because Spark does not rewrite a
+DELETE whose child is a `Filter`/`Project`, and it threw the alias away before Spark had resolved
+the condition, which is why `DELETE FROM tgt_f AS t WHERE t.k = 1` could not resolve on the
+cluster path either. Sources are not DML targets: a MERGE source (table, subquery) on a secured
+table keeps its wrappers inside the rewritten plan exactly as a SELECT does.
+
 Not changed, on purpose: INSERT targets (`InsertIntoStatement.table` is not a plan child, so
 neither the parser nor this rule ever sees it; Spark resolves it and strips the alias itself,
 `AppendData.table` stays the bare relation), the row/column security policy for DELETE / UPDATE /
@@ -72,12 +94,16 @@ against the mock VAST server. They live in `TestVastCatalog` for the same reason
 The connector resolution path is reproduced with `VastCatalogTestUtils`, which answers an empty,
 non-null security response for every table; the Spark resolution path is the mock server's default.
 
-* `TestNDBRCLSResolvedRelationAdaptorRule` (4) — a suffixed lookup alias (RCLS suffix, RCLS +
+* `TestNDBRCLSResolvedRelationAdaptorRule` (6) — a suffixed lookup alias (RCLS suffix, RCLS +
   row-level-op suffix) is renamed to the plain table name with its qualifier kept, a plain alias is
   left alone; a DELETE keeps the alias of its target; a row filter under the alias is merged into
   the DELETE condition and the alias kept (and merged as before without an alias); a column mask
   under the alias is refused for DELETE, a row filter or a column mask under the alias is refused
-  for UPDATE, an UPDATE on a plain aliased relation is left alone.
+  for UPDATE, an UPDATE on a plain aliased relation is left alone. Nested aliases (the user's
+  above the connector's): a row filter underneath is merged in one application with both aliases
+  kept, a column mask refused, UPDATE refused on either. A MERGE target with a row filter or a
+  column mask is refused bare, under the connector's alias and under a user alias above it, with
+  and without the marker; a plain aliased MERGE target is left alone.
 * `TestVastCatalog`, connector path (7): `tgt.k`, `schem.tgt.k`, `buck.schem.tgt.k` and
   `ndb.buck.schem.tgt.k` all resolve, exactly one alias `tgt` with qualifier `[ndb, buck, schem]`
   directly above the relation whose identifier has no suffixes, and the same after
@@ -92,6 +118,14 @@ non-null security response for every table; the Spark resolution path is the moc
   `INSERT *` with an unaliased target too), insert-only MERGE and plain INSERT keep the bare target
   and get an aliased source; a view whose query uses `tgt.k` can be created and queried with
   `v1.key`, with the `tgt` alias inside.
+* `TestVastCatalog`, connector path, row/column security (2): for a row-filtered (`k > 10`) and a
+  column-masked table, three target forms — unaliased with unqualified columns, unaliased with
+  table-qualified columns, `AS t` with `t.`-qualified columns: DELETE on the filtered table gives
+  a `WriteDelta` whose condition contains both the user's predicate and `k > 10`; DELETE on the
+  masked table, UPDATE on either, MERGE on either (explicit actions, and `SET *` / `INSERT *`)
+  are refused with the existing messages. A MERGE source on the filtered table keeps the `Filter`
+  on the source side of the rewritten plan (table source, subquery source, and the insert-only
+  `AppendData`), on the masked table the `Project` with the mask, as a plain SELECT does.
 * `TestVastCatalog`, Spark path (1): DELETE / UPDATE / MERGE by table name.
 * `testMergeUnaliasedTargetResolvedByConnector` now asserts the alias instead of its absence.
 * `TestNDBParserMergeInto`: an unaliased target is a bare `UnresolvedRelation` under the marker.
@@ -99,7 +133,12 @@ non-null security response for every table; the Spark resolution path is the moc
 **Fails before / passes after**, both trees, same command with the targeted `-Dtest` filter:
 34 tests, 15 failures before the change (every new analysis test and `testMergeUnaliasedTarget…`
 with `UNRESOLVED_COLUMN`, the view test with `TABLE_OR_VIEW_NOT_FOUND`, the adaptor's DELETE and
-suffix tests, the two parser tests), 0 after.
+suffix tests, the two parser tests), 0 after. The four security tests, run against the MERGE
+branch's main sources with only the tests added: the unqualified forms of the matrix pass there
+too (a row filter is merged, the rest refused — the same outcomes this PR keeps), the
+table-qualified forms fail with `UNRESOLVED_COLUMN`, the secured-source test fails the same way
+on its first MERGE, the nested-alias unit test fails (no merge in one application), the
+MERGE-target unit test passes (that branch is unchanged); 0 failures after.
 
 ## Results
 
@@ -115,8 +154,8 @@ and the same for `plugin/spark3/spark35-scala212`.
 
 | module | before (MERGE branch) | after |
 |---|---|---|
-| `spark35` | 151 tests, 0 failures | 163 tests, 0 failures |
-| `spark35-scala212` | 150 tests, 0 failures | 162 tests, 0 failures |
+| `spark35` | 151 tests, 0 failures | 166 tests, 0 failures |
+| `spark35-scala212` | 150 tests, 0 failures | 165 tests, 0 failures |
 
 Checkstyle runs in the same build and passes.
 
@@ -155,6 +194,54 @@ SELECT v1.key FROM ndb.b.s.v1 WHERE v1.key = 1;
 
 The MERGE PR's own checklist should be re-run as well, since its target alias now comes from the
 resolution rule instead of the parser.
+
+### Row/column security on a cluster
+
+Neither PR has been run against a cluster with security policies. The mock-server tests pin the
+*plan shapes* (filter merged into the DELETE condition, refusals, wrappers on the source side);
+what only a cluster can show is the resulting rows. Setup, following the VAST "Row and Column
+Security" guide: an identity policy for a restricted user with a `RowColumnSecurity` statement on
+`b/s/tgt_f` (`RowFilter` `{"QueryEngine": ["Spark"], "FilterString": "k > 10"}`) and one on
+`b/s/tgt_m` (`ColumnMask` `{"QueryEngine": ["Spark"], "ColumnName": "v", "MaskString":
+"regexp_replace(v, '[0-9]', '***')"}`); `s3:TabularGetRowColumnSecurity` allowed for the
+connector's credentials; `spark.ndb.enable_row_column_security` left at its default (`true`); the
+Spark session either running with the restricted user's credentials, or with
+`spark.ndb.enable_end_user_impersonation=true` and `spark.sql.session.user=<restricted user>`
+(`s3:TabularEndUserImpersonation` allowed). Tables: `tgt_f` and `tgt_m` `(k INT, v STRING)` with
+rows on both sides of `k = 10`, `src (k INT, v STRING, op STRING)`, `tgt` as in the MERGE PR.
+
+Expected, as the restricted user, on both PR branches (the MERGE branch has the bare relation, so
+the table-qualified forms fail there with `UNRESOLVED_COLUMN`; the outcomes of the forms that do
+resolve must be the same on both):
+
+```sql
+-- SELECT sees only k > 10 on tgt_f, masked v on tgt_m, qualified or not
+SELECT * FROM ndb.b.s.tgt_f;
+SELECT tgt_f.k FROM ndb.b.s.tgt_f WHERE tgt_f.k < 100;
+SELECT tgt_m.v FROM ndb.b.s.tgt_m;
+-- DELETE on the filtered table only touches visible rows: count the rows with k <= 10 as an
+-- unrestricted user before and after, it must not change
+DELETE FROM ndb.b.s.tgt_f WHERE k < 100;
+DELETE FROM ndb.b.s.tgt_f WHERE tgt_f.k < 100;
+DELETE FROM ndb.b.s.tgt_f AS t WHERE t.k < 100;
+-- refused, with the existing messages
+UPDATE ndb.b.s.tgt_f SET v = 'x' WHERE tgt_f.k = 11;   -- Update table is not allowed by current VAST security policy rules
+DELETE FROM ndb.b.s.tgt_m WHERE tgt_m.k = 1;           -- Delete from table is not allowed ...
+UPDATE ndb.b.s.tgt_m SET v = 'x' WHERE tgt_m.k = 1;    -- Update table is not allowed ...
+MERGE INTO ndb.b.s.tgt_f USING ndb.b.s.src ON tgt_f.k = src.k WHEN MATCHED THEN DELETE;                 -- Merge into table is not allowed ...
+MERGE INTO ndb.b.s.tgt_m t USING ndb.b.s.src s ON t.k = s.k
+  WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;                                        -- Merge into table is not allowed ...
+-- a MERGE source on a secured table sees what a SELECT sees
+MERGE INTO ndb.b.s.tgt t USING ndb.b.s.tgt_f ON t.k = tgt_f.k
+  WHEN MATCHED THEN UPDATE SET v = tgt_f.v WHEN NOT MATCHED THEN INSERT *;   -- rows of tgt_f with k <= 10 update and insert nothing
+MERGE INTO ndb.b.s.tgt t USING ndb.b.s.tgt_m ON t.k = tgt_m.k
+  WHEN MATCHED THEN UPDATE SET v = tgt_m.v;                                  -- the written v values are the masked ones
+MERGE INTO ndb.b.s.tgt t USING (SELECT * FROM ndb.b.s.tgt_f) s ON t.k = s.k WHEN MATCHED THEN DELETE;   -- only k > 10 matches
+```
+
+Column allow/deny policies are read by the connector (`ParsedRowColumnSecurity`) but produce no
+plan wrapper, so the alias does not interact with them; a quick `SELECT` of a denied column as the
+restricted user, before and after, is still worth a look.
 
 ## Follow-ups (not in this PR)
 

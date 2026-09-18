@@ -3460,8 +3460,55 @@ public class TestVastCatalog
         }
     }
 
+    private static String relationName(LogicalPlan plan)
+    {
+        return plan instanceof DataSourceV2Relation ?
+                ((DataSourceV2Relation) plan).identifier().get().name() :
+                "";
+    }
+
+    // the policy's row filter, directly above the table's relation
+    private static boolean hasRowFilterOver(LogicalPlan plan, String table)
+    {
+        java.util.List<LogicalPlan> found = new ArrayList<>();
+        plan.foreach(node -> {
+            if (node instanceof Filter && ((Filter) node).condition().toString().contains("> 10")
+                    && relationName(((Filter) node).child()).equals(table)) {
+                found.add(node);
+            }
+            return null;
+        });
+        return !found.isEmpty();
+    }
+
+    // the policy's column mask, directly above the table's relation
+    private static boolean hasColumnMaskOver(LogicalPlan plan, String table)
+    {
+        java.util.List<LogicalPlan> found = new ArrayList<>();
+        plan.foreach(node -> {
+            if (node instanceof Project
+                    && ((Project) node).projectList().toString().contains("regexp_replace")
+                    && relationName(((Project) node).child()).equals(table)) {
+                found.add(node);
+            }
+            return null;
+        });
+        return !found.isEmpty();
+    }
+
+    private static void assertRefused(SparkSession session, String sql, String message)
+    {
+        assertThatThrownBy(() -> analyzePlan(session, sql))
+                .as(sql)
+                .isInstanceOf(VastRuntimeException.class)
+                .hasMessageContaining(message);
+    }
+
+    // The row/column security outcome must not depend on the aliases above the target (the
+    // connector's, a user's, or both): a row filter is merged into a DELETE and refused for
+    // UPDATE and MERGE, a column mask is refused for all three, with the existing messages.
     @Test
-    public void testConnectorResolvedRowLevelSecurityPolicyIsUnchangedByTheAlias()
+    public void testConnectorResolvedRowLevelSecurityOutcomesForAliasedAndUnaliasedTargets()
             throws VastUserException
     {
         try (SparkSession session = SparkTestUtils.getSession(testPort)) {
@@ -3469,31 +3516,75 @@ public class TestVastCatalog
             VastCatalogTestUtils utils = connectorResolution(session);
             utils.setRowColumnsSecurityResponse("buck/schem", "tgt_filtered", rowFilter());
             utils.setRowColumnsSecurityResponse("buck/schem", "tgt_masked", columnMask());
-            // the row filter is merged into the delete condition, with or without a qualifier
-            for (String where : new String[] {"k = 1", "tgt_filtered.k = 1"}) {
+            // {target suffix, qualifier of the filtered table's columns, of the masked table's}
+            String[][] forms = {{"", "", ""}, {"", "tgt_filtered.", "tgt_masked."}, {" AS t", "t.", "t."}};
+            for (String[] form : forms) {
+                String filtered = FILTERED_TARGET + form[0];
+                String masked = MASKED_TARGET + form[0];
+                String fq = form[1];
+                String mq = form[2];
                 WriteDelta delete = analyzeRowLevel(session,
-                        "DELETE FROM " + FILTERED_TARGET + " WHERE " + where, RowLevelDelete.class);
+                        "DELETE FROM " + filtered + " WHERE " + fq + "k = 1", RowLevelDelete.class);
                 String condition = delete.condition().toString();
                 assertTrue(condition.contains("= 1") && condition.contains("> 10"),
-                        "delete condition: " + condition);
+                        "delete condition for " + filtered + ": " + condition);
+                assertRefused(session, "DELETE FROM " + masked + " WHERE " + mq + "k = 1",
+                        "Delete from table is not allowed by current VAST security policy rules");
+                assertRefused(session, "UPDATE " + filtered + " SET v = 'x' WHERE " + fq + "k = 1",
+                        "Update table is not allowed by current VAST security policy rules");
+                assertRefused(session, "UPDATE " + masked + " SET v = 'x' WHERE " + mq + "k = 1",
+                        "Update table is not allowed by current VAST security policy rules");
+                String fOn = fq.isEmpty() ? "tgt_filtered." : fq;
+                String mOn = mq.isEmpty() ? "tgt_masked." : mq;
+                assertRefused(session, "MERGE INTO " + filtered + " USING " + MERGE_SOURCE +
+                                " ON " + fOn + "k = src.k WHEN MATCHED THEN DELETE",
+                        "Merge into table is not allowed by current VAST security policy rules");
+                assertRefused(session, "MERGE INTO " + masked + " USING " + MERGE_SOURCE +
+                                " s ON " + mOn + "k = s.k WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+                        "Merge into table is not allowed by current VAST security policy rules");
             }
-            assertThatThrownBy(() -> analyzePlan(session,
-                    "UPDATE " + FILTERED_TARGET + " SET v = 'x' WHERE tgt_filtered.k = 1"))
-                    .isInstanceOf(VastRuntimeException.class)
-                    .hasMessageContaining("Update table is not allowed by current VAST security policy rules");
-            assertThatThrownBy(() -> analyzePlan(session,
-                    "DELETE FROM " + MASKED_TARGET + " WHERE tgt_masked.k = 1"))
-                    .isInstanceOf(VastRuntimeException.class)
-                    .hasMessageContaining("Delete from table is not allowed by current VAST security policy rules");
-            assertThatThrownBy(() -> analyzePlan(session,
-                    "UPDATE " + MASKED_TARGET + " SET v = 'x' WHERE tgt_masked.k = 1"))
-                    .isInstanceOf(VastRuntimeException.class)
-                    .hasMessageContaining("Update table is not allowed by current VAST security policy rules");
-            assertThatThrownBy(() -> analyzePlan(session,
-                    "MERGE INTO " + FILTERED_TARGET + " USING " + MERGE_SOURCE + " ON tgt_filtered.k = src.k " +
-                            "WHEN MATCHED THEN DELETE"))
-                    .isInstanceOf(VastRuntimeException.class)
-                    .hasMessageContaining("Merge into table is not allowed by current VAST security policy rules");
+        }
+    }
+
+    // A MERGE whose source is a table with a row filter or a column mask sees what a SELECT
+    // sees: the wrappers stay on the source side of the rewritten plan
+    @Test
+    public void testConnectorResolvedMergeSourceOnSecuredTableSeesWhatSelectSees()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            VastCatalogTestUtils utils = connectorResolution(session);
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_filtered", rowFilter());
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_masked", columnMask());
+            assertTrue(hasRowFilterOver(analyzePlan(session, "SELECT * FROM " + FILTERED_TARGET),
+                    "tgt_filtered"));
+            assertTrue(hasColumnMaskOver(analyzePlan(session, "SELECT * FROM " + MASKED_TARGET),
+                    "tgt_masked"));
+            WriteDelta filteredSource = analyzeRowLevel(session,
+                    "MERGE INTO " + MERGE_TARGET + " t USING " + FILTERED_TARGET + " ON t.k = tgt_filtered.k " +
+                            "WHEN MATCHED THEN UPDATE SET v = tgt_filtered.v WHEN NOT MATCHED THEN INSERT *",
+                    RowLevelMerge.class);
+            assertTrue(hasRowFilterOver(filteredSource.query(), "tgt_filtered"),
+                    "merge plan: " + filteredSource.query());
+            WriteDelta maskedSource = analyzeRowLevel(session,
+                    "MERGE INTO " + MERGE_TARGET + " t USING " + MASKED_TARGET + " ON t.k = tgt_masked.k " +
+                            "WHEN MATCHED THEN UPDATE SET v = tgt_masked.v",
+                    RowLevelMerge.class);
+            assertTrue(hasColumnMaskOver(maskedSource.query(), "tgt_masked"),
+                    "merge plan: " + maskedSource.query());
+            WriteDelta subquerySource = analyzeRowLevel(session,
+                    "MERGE INTO " + MERGE_TARGET + " t USING (SELECT * FROM " + FILTERED_TARGET + ") s ON t.k = s.k " +
+                            "WHEN MATCHED THEN DELETE",
+                    RowLevelMerge.class);
+            assertTrue(hasRowFilterOver(subquerySource.query(), "tgt_filtered"),
+                    "merge plan: " + subquerySource.query());
+            LogicalPlan insertOnly = analyzePlan(session,
+                    "MERGE INTO " + MERGE_TARGET + " t USING " + FILTERED_TARGET + " ON t.k = tgt_filtered.k " +
+                            "WHEN NOT MATCHED THEN INSERT *");
+            assertTrue(insertOnly instanceof AppendData, "analyzed plan: " + insertOnly);
+            assertTrue(hasRowFilterOver(((AppendData) insertOnly).query(), "tgt_filtered"),
+                    "append plan: " + insertOnly);
         }
     }
 
