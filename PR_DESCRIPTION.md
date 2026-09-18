@@ -138,14 +138,26 @@ Reported results, for a plain table and for a table with sorted columns (DEC128 
 * the only failures are the two unaliased-source cases noted under "Observed, not changed", which
   fail the same way without this PR.
 
+Row/column security, run afterwards on the same build (VAST 5.5.0.1, the session running as a
+restricted user, no impersonation) with an identity policy carrying a row filter `k > 10` on
+`tgt_f`, a column mask `regexp_replace(v, '[0-9]', '***')` on `tgt_m` and a column deny on `v` of
+`tgt_d`, with an admin read-back after every statement:
+
+* MERGE into `tgt_f` or `tgt_m`, aliased or not, is refused with "Merge into table is not allowed
+  by current VAST security policy rules"; UPDATE on either and DELETE on `tgt_m` are refused as
+  before; DELETE on `tgt_f` removes only the rows the filter shows, the hidden rows (`k <= 10`)
+  stay intact;
+* a MERGE whose source is `tgt_f` (aliased `s`; the unaliased form does not resolve on this
+  branch, see "Observed") updates and inserts nothing from the hidden rows, a source
+  `(SELECT * FROM tgt_f)` matches only `k > 10`, a MERGE whose source is `tgt_m` writes the masked
+  values;
+* no hidden row or value was read, deleted or updated by any statement.
+
 Not verified on a cluster:
 
-* the row/column-security case at the end of the list (a MERGE into a table with a row filter or
-  a column mask must be refused; a MERGE whose *source* is such a table must see only what a
-  SELECT sees): the test cluster had no security policies. The mock-server tests
-  `testMergeWithColumnMaskIsRefused` / `testMergeWithRowFilterIsRefused` cover the refusal at
-  analysis only;
-* the `spark35-scala212` build.
+* the `spark35-scala212` build;
+* the end-user impersonation path (`spark.ndb.enable_end_user_impersonation`); the security run
+  used the restricted user's own credentials.
 
 The scenarios, so a maintainer can repeat them:
 
@@ -222,7 +234,7 @@ SELECT ndb.commit_tx();   -- and the same run with SELECT ndb.rollback_tx();
 DELETE FROM ndb.b.s.tgt WHERE k = 1;
 UPDATE ndb.b.s.tgt SET n = n + 1 WHERE k = 2;
 
--- NOT RUN (no security policies on the test cluster), see "Not verified on a cluster" above:
+-- run afterwards with security policies, see "Row/column security" above:
 -- a user restricted by row/column security: MERGE into a table with a row filter or column mask
 -- must fail with "Merge into table is not allowed by current VAST security policy rules",
 -- and a MERGE whose *source* is such a table must see only what a SELECT sees.
@@ -289,6 +301,17 @@ Things a maintainer should know:
   ``tgt VAST_DB_ROW_LEVEL_OP`.`k``), `DELETE FROM ndb.buck.schem.tgt AS t WHERE t.k = 1` works
   (verified with a throwaway test, not kept). This PR only aliases the MERGE target; sources,
   SELECT, DELETE and UPDATE are left as they are.
+* `CREATE VIEW` whose query fails analysis: on the cluster (this branch, `CREATE VIEW ndb.b.s.v1 AS
+  SELECT tgt.k AS key, tgt.v FROM ndb.b.s.tgt WHERE tgt.k > 0`, where `tgt.k` does not resolve
+  without the qualifier PR) the statement reports success and no view exists afterwards; on the
+  mock server the view is created and the first SELECT on it fails with `TABLE_OR_VIEW_NOT_FOUND`.
+  `NDBTablesResolutionRule` analyses the view query with `Analyzer.execute`, without
+  `checkAnalysis`. Same on both branches, not caused by this PR.
+* DML on a table with a column-deny policy is not refused by the connector: a DELETE fails at run
+  time with the server's 403 ("failed to delete rows, some columns are not allowed"), nothing
+  deleted; an UPDATE or MERGE assigning the denied column fails at analysis because the column is
+  not exposed. Safe, but unlike row filters and masks there is no connector-level refusal message.
+  Same on both branches.
 * With `spark.ndb.max_row_count_per_insert=5000`, a plain 300k-row `INSERT` stores 20,000 all-NULL rows
   and loses 20,000 real ones (found on a cluster while testing this PR). Upstream `master` behaves the
   same and the default chunk size is fine, so it is not caused by this PR; it is reported separately.
