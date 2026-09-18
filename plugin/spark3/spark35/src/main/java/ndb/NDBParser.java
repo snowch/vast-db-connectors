@@ -21,6 +21,7 @@ import org.apache.spark.sql.catalyst.plans.logical.CreateView;
 import org.apache.spark.sql.catalyst.plans.logical.DeleteFromTable;
 import org.apache.spark.sql.catalyst.plans.logical.DropView;
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
+import org.apache.spark.sql.catalyst.plans.logical.MergeIntoTable;
 import org.apache.spark.sql.catalyst.plans.logical.RenameTable;
 import org.apache.spark.sql.catalyst.plans.logical.ShowViews;
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias;
@@ -40,6 +41,7 @@ import java.util.HashSet;
 
 import static java.lang.String.format;
 import static ndb.SparkPlannerUtil.addVastResolutionSuffixes;
+import static ndb.SparkPlannerUtil.removeVastResolutionSuffixes;
 
 public class NDBParser
         implements ParserInterface
@@ -114,8 +116,75 @@ public class NDBParser
                     "NDBParser.parsePlan original LogicalPlan is an RenameTable(isView=True) plan");
             return RenameNDBViewPlan.instance((RenameTable) original);
         }
-        return original.transformUp(
-                PartialFunction.fromFunction(getSecurityWrapper(original)));
+        return original.transformUp(PartialFunction.fromFunction(
+                withMergeTargetAdaptor(getSecurityWrapper(original))));
+    }
+
+    /**
+     * Extends the security wrapper so that the target of a MERGE INTO plan is
+     * resolved as a row level operation, like the target of DELETE/UPDATE.
+     * The plan is transformed bottom-up, so by the time the MergeIntoTable
+     * node is visited, every relation in it (target included) has already
+     * been through the security wrapper. The target is re-suffixed here,
+     * the source side is left with the regular security treatment.
+     */
+    private Function1<LogicalPlan, LogicalPlan> withMergeTargetAdaptor(
+            Function1<LogicalPlan, LogicalPlan> securityWrapper)
+    {
+        return plan -> {
+            if (plan instanceof MergeIntoTable) {
+                return adaptMergeIntoTable((MergeIntoTable) plan);
+            }
+            return securityWrapper.apply(plan);
+        };
+    }
+
+    private LogicalPlan adaptMergeIntoTable(MergeIntoTable merge)
+    {
+        if (merge.matchedActions().isEmpty() && merge
+                .notMatchedBySourceActions()
+                .isEmpty()) {
+            // Spark rewrites a MERGE with only WHEN NOT MATCHED actions into a
+            // plain AppendData and never asks for a row level operation, so the
+            // target must keep its regular (non row level op) resolution
+            LOG.debug(
+                    "NDBParser.parsePlan leaving insert-only MergeIntoTable unchanged: {}",
+                    merge);
+            return merge;
+        }
+        LogicalPlan adaptedTarget = adaptMergeTargetRelation(
+                merge.targetTable());
+        if (adaptedTarget == null) {
+            LOG.warn(
+                    "NDBParser.parsePlan unexpected MergeIntoTable target, leaving plan unchanged: {}",
+                    merge.targetTable());
+            return merge;
+        }
+        MergeIntoTable adapted = merge.copy(new NDBMergeTarget(adaptedTarget),
+                merge.sourceTable(), merge.mergeCondition(),
+                merge.matchedActions(), merge.notMatchedActions(),
+                merge.notMatchedBySourceActions());
+        LOG.info("Transformed merge into table plan: {}", adapted);
+        return adapted;
+    }
+
+    // Only the target relation itself is adapted, through its alias if any.
+    // Returns null when the target is not a (possibly aliased) relation.
+    private LogicalPlan adaptMergeTargetRelation(LogicalPlan target)
+    {
+        if (target instanceof UnresolvedRelation) {
+            UnresolvedRelation withoutSuffixes = removeVastResolutionSuffixes(
+                    (UnresolvedRelation) target);
+            return addVastResolutionSuffixes(withoutSuffixes, true, true);
+        }
+        else if (target instanceof SubqueryAlias) {
+            SubqueryAlias alias = (SubqueryAlias) target;
+            LogicalPlan adaptedChild = adaptMergeTargetRelation(alias.child());
+            return adaptedChild == null ?
+                    null :
+                    new SubqueryAlias(alias.identifier(), adaptedChild);
+        }
+        return null;
     }
 
     private Function1<LogicalPlan, LogicalPlan> getSecurityWrapper(

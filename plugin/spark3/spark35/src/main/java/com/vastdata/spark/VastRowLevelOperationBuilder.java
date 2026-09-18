@@ -41,6 +41,9 @@ public class VastRowLevelOperationBuilder
         else if (info.command().equals(RowLevelOperation.Command.UPDATE)) {
             return new RowLevelUpdate(vastTable);
         }
+        else if (info.command().equals(RowLevelOperation.Command.MERGE)) {
+            return new RowLevelMerge(vastTable);
+        }
         throw new UnsupportedOperationException(
                 format("Unsupported row level operation: %s", info));
     }

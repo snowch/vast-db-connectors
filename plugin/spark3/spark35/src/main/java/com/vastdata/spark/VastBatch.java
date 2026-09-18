@@ -396,7 +396,7 @@ public class VastBatch
                     vastSchedulingInfo);
             if (table.getTableMD().isForUpdate() || table
                     .getTableMD()
-                    .isForDelete()) {
+                    .isForDelete() || table.getTableMD().isForMerge()) {
                 vastPartitionReaderFactory.setForAlter();
             }
         }

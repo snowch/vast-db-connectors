@@ -14,6 +14,7 @@ public class VastTableMetaData
     public final StructType schema;
     private boolean forUpdate = false;
     private boolean forDelete = false;
+    private boolean forMerge = false;
 
     public VastTableMetaData(String schemaName, String tableName,
             String handleID, StructType schema, boolean forImportData)
@@ -40,6 +41,16 @@ public class VastTableMetaData
     public boolean isForDelete()
     {
         return forDelete;
+    }
+
+    public void setForMerge()
+    {
+        forMerge = true;
+    }
+
+    public boolean isForMerge()
+    {
+        return forMerge;
     }
 
     @Override

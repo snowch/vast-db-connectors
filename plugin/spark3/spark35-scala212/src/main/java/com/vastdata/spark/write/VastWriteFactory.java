@@ -22,6 +22,7 @@ import com.vastdata.spark.write.bg.FunctionalQ;
 import com.vastdata.spark.write.bg.Status;
 import com.vastdata.spark.write.bg.VastBGWriter;
 import com.vastdata.spark.write.bg.VastBGWriterFactory;
+import com.vastdata.spark.write.bg.VastWriteMode;
 import ndb.ComplexRowIDPredicate;
 import ndb.NDB;
 import org.apache.arrow.memory.BufferAllocator;
@@ -40,6 +41,7 @@ import org.apache.spark.sql.connector.write.DeltaWriter;
 import org.apache.spark.sql.connector.write.DeltaWriterFactory;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.execution.arrow.ArrowWriter;
+import org.apache.spark.sql.types.Decimal;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.slf4j.Logger;
@@ -57,15 +59,19 @@ import spark.sql.catalog.ndb.YearsFunction;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
@@ -76,6 +82,7 @@ import static com.vastdata.client.error.VastExceptionFactory.toRuntime;
 import static com.vastdata.client.schema.ArrowSchemaUtils.ROW_ID_DEC128_FIELD;
 import static com.vastdata.client.schema.ArrowSchemaUtils.ROW_ID_INT64_FIELD;
 import static com.vastdata.spark.SparkArrowVectorUtil.ROW_ID_SIGNED_ADAPTOR;
+import static com.vastdata.spark.SparkArrowVectorUtil.VASTDB_SPARK_DEC128_ROW_ID_NONNULL;
 import static com.vastdata.spark.SparkArrowVectorUtil.VASTDB_SPARK_INT64_ROW_ID_NONNULL;
 import static java.lang.String.format;
 import static ndb.NDBSparkSessionExtension.getSessionUser;
@@ -110,6 +117,9 @@ public class VastWriteFactory
     private final List<Integer> partitionIndices;
     private final List<String> transformNames;
     private final List<Integer> transformArgs;
+    // set only by the package private constructor (tests); executors always use
+    // VAST_CLIENT_SUPPLIER_FROM_SPARK_CONTEXT
+    private transient Function<VastConfig, VastClient> vastClientSupplier;
     private transient RecordBatchSplitterMetrics splitterMetrics;
     private transient ByColumnInserterMetrics insertMetrics;
     private transient ExecutorService ioExecutor;
@@ -152,13 +162,92 @@ public class VastWriteFactory
         this.nonUpdatableColumns = vastTable.getNonUpdatableColumns();
     }
 
+    VastWriteFactory(VastTransaction tx, VastConfig vastConfig,
+            VastTable vastTable, List<URI> dataEndpoints,
+            Map<String, String> sessionConfig,
+            Function<VastConfig, VastClient> vastClientSupplier)
+    {
+        this(tx, vastConfig, vastTable, dataEndpoints, sessionConfig);
+        this.vastClientSupplier = vastClientSupplier;
+    }
+
     @Override
     public DeltaWriter<InternalRow> createWriter(int partitionId, long taskId)
     {
-        VastWriter vastDataWriter = new VastWriter(partitionId, taskId);
+        if (vastTableMetaData.isForMerge()) {
+            VastMergeWriter mergeWriter = new VastMergeWriter(partitionId,
+                    taskId);
+            FACTORY_LOG.info(
+                    "Created new merge writer: {} for partitionId={}, taskId={}",
+                    mergeWriter.name(), partitionId, taskId);
+            return mergeWriter;
+        }
+        VastWriter vastDataWriter = new VastWriter(partitionId, taskId,
+                singleWriteMode(), rollbackTransaction());
         FACTORY_LOG.info("Created new writer: {} for partitionId={}, taskId={}",
                 vastDataWriter.name(), partitionId, taskId);
         return vastDataWriter;
+    }
+
+    private VastWriteMode singleWriteMode()
+    {
+        if (vastTableMetaData.forImportData) {
+            return VastWriteMode.IMPORT;
+        }
+        else if (vastTableMetaData.isForDelete()) {
+            return VastWriteMode.DELETE;
+        }
+        else if (vastTableMetaData.isForUpdate()) {
+            return VastWriteMode.UPDATE;
+        }
+        return VastWriteMode.INSERT;
+    }
+
+    private Function<VastConfig, VastClient> clientSupplier()
+    {
+        return vastClientSupplier != null ?
+                vastClientSupplier :
+                VAST_CLIENT_SUPPLIER_FROM_SPARK_CONTEXT;
+    }
+
+    private Callable<Void> rollbackTransaction()
+    {
+        return () -> {
+            VastClient vastClient = clientSupplier().apply(vastConfig);
+            vastClient.rollbackTransaction(tx, null);
+            return null;
+        };
+    }
+
+    private static Callable<Void> atMostOnce(Callable<Void> action)
+    {
+        AtomicBoolean done = new AtomicBoolean(false);
+        return () -> done.compareAndSet(false, true) ? action.call() : null;
+    }
+
+    // For MERGE the table schema carries the row id at field 0 (the scan
+    // returns it, and the UPDATE/DELETE contexts expect it). Inserted rows
+    // must not carry it, so the INSERT context works on the data columns only.
+    private StructType dataColumnsSchema()
+    {
+        StructField[] fields = vastTableMetaData.schema.fields();
+        String first = fields.length > 0 ? fields[0].name() : null;
+        if (!VASTDB_SPARK_INT64_ROW_ID_NONNULL.getName().equals(
+                first) && !VASTDB_SPARK_DEC128_ROW_ID_NONNULL.getName().equals(
+                first)) {
+            throw new IllegalStateException(format(
+                    "Expected the row id as the first field of the MERGE table schema: %s",
+                    vastTableMetaData.schema));
+        }
+        return new StructType(Arrays.copyOfRange(fields, 1, fields.length));
+    }
+
+    private List<Expression> dataColumnsReferences()
+    {
+        StructField[] fields = vastTableMetaData.schema.fields();
+        return IntStream.range(1, fields.length).mapToObj(
+                i -> (Expression) new BoundReference(i, fields[i].dataType(),
+                        fields[i].nullable())).collect(Collectors.toList());
     }
 
     private class VastWriter
@@ -177,21 +266,22 @@ public class VastWriteFactory
         private final QueueCtx defaultCtx;
         private final java.util.Map<InternalRow, QueueCtx> partitionedCtxs;
         private final MutableProjection projector;
+        private final VastWriteMode mode;
         private Status status;
 
-        private VastWriter(int dataWriterIndex, Object traceObj)
+        private VastWriter(int dataWriterIndex, Object traceObj,
+                VastWriteMode mode, Callable<Void> txRollback)
         {
             this.dataWriteTraceToken = format("(%s:%s:%s)", vastTraceTokenStr,
                     traceObj, dataWriterIndex);
             this.dataWriterIndex = dataWriterIndex;
+            this.mode = mode;
             this.bgTaskPhasesCompletionListener = new AwaitableCompletionListener(
                     2); // 2 phases - this, VastBGWriter
             this.bgTaskPhasesCompletionListener.registerFailureAction(() -> {
                 DATA_WRITER_LOG.info("VastWriter{} Rolling back tx: {}",
                         dataWriteTraceToken, tx);
-                VastClient vastClient = NDB.getVastClient(vastConfig);
-                vastClient.rollbackTransaction(tx, null);
-                return null;
+                return txRollback.call();
             });
             this.status = new Status(true, null);
             this.writerAllocator = VastArrowAllocator
@@ -199,7 +289,7 @@ public class VastWriteFactory
                     .newChildAllocator(
                             format("VastWriter%s", this.dataWriteTraceToken), 0,
                             Long.MAX_VALUE);
-            if (vastTableMetaData.isForDelete()) {
+            if (mode == VastWriteMode.DELETE) {
                 this.chunkSize = vastConfig.getMaxRowsPerDelete();
                 this.writeModeAdaptor = complexRowID ?
                         UnaryOperator.identity() :
@@ -217,7 +307,7 @@ public class VastWriteFactory
                 this.partitionedCtxs = null;
                 this.projector = null;
             }
-            else if (vastTableMetaData.isForUpdate()) {
+            else if (mode == VastWriteMode.UPDATE) {
                 this.chunkSize = vastConfig.getMaxRowsPerUpdate();
                 if (!complexRowID) {
                     this.writeModeAdaptor = ROW_ID_SIGNED_ADAPTOR;
@@ -248,7 +338,9 @@ public class VastWriteFactory
             else {
                 this.chunkSize = vastConfig.getMaxRowsPerInsert();
                 this.writeModeAdaptor = UnaryOperator.identity();
-                StructType writeSchema = vastTableMetaData.schema;
+                StructType writeSchema = vastTableMetaData.isForMerge() ?
+                        dataColumnsSchema() :
+                        vastTableMetaData.schema;
                 DATA_WRITER_LOG.info(
                         "VastWriter{}: INSERT chunkSize = {}, writeSchema = {}",
                         dataWriteTraceToken, chunkSize, writeSchema);
@@ -340,26 +432,26 @@ public class VastWriteFactory
         private VastBGWriter getWriter(int ordinal, URI endpoint)
         {
             String endUser = getSessionUser(vastConfig, sessionConfig);
-            if (vastTableMetaData.forImportData) {
+            if (mode == VastWriteMode.IMPORT) {
                 return VastBGWriterFactory.forImport(
                         ordinal,
-                        VAST_CLIENT_SUPPLIER_FROM_SPARK_CONTEXT,
+                        clientSupplier(),
                         this.dataWriteTraceToken, vastConfig, endpoint, tx,
                         vastTableMetaData.schemaName,
                         vastTableMetaData.tableName, this.insertArrowVectorsQ
                 );
             }
-            else if (vastTableMetaData.isForUpdate()) {
+            else if (mode == VastWriteMode.UPDATE) {
                 return VastBGWriterFactory.forUpdate(ordinal,
-                        VAST_CLIENT_SUPPLIER_FROM_SPARK_CONTEXT,
+                        clientSupplier(),
                         this.dataWriteTraceToken, vastConfig, endpoint, tx,
                         vastTableMetaData.schemaName,
                         vastTableMetaData.tableName, this.insertArrowVectorsQ,
                         endUser);
             }
-            else if (vastTableMetaData.isForDelete()) {
+            else if (mode == VastWriteMode.DELETE) {
                 return VastBGWriterFactory.forDelete(ordinal,
-                        VAST_CLIENT_SUPPLIER_FROM_SPARK_CONTEXT,
+                        clientSupplier(),
                         this.dataWriteTraceToken, vastConfig, endpoint, tx,
                         vastTableMetaData.schemaName,
                         vastTableMetaData.tableName, this.insertArrowVectorsQ,
@@ -385,7 +477,7 @@ public class VastWriteFactory
                             new ThreadFactoryBuilder().setNameFormat("vast-insert-cpu-%d").build());
                 }
                 return VastBGWriterFactory.forInsert(ordinal,
-                        VAST_CLIENT_SUPPLIER_FROM_SPARK_CONTEXT,
+                        clientSupplier(),
                         this.dataWriteTraceToken, vastConfig, endpoints, tx,
                         vastTableMetaData.schemaName,
                         vastTableMetaData.tableName, this.insertArrowVectorsQ, endUser,
@@ -411,11 +503,11 @@ public class VastWriteFactory
 
         private Queue<InternalRow> createRowsQueue()
         {
-            if (vastTableMetaData.isForDelete()) {
+            if (mode == VastWriteMode.DELETE) {
                 return InternalRowsQFactory.forDelete(chunkSize, complexRowID);
             }
 
-            if (vastTableMetaData.isForUpdate()) {
+            if (mode == VastWriteMode.UPDATE) {
                 return InternalRowsQFactory.forUpdate(chunkSize, complexRowID);
             }
 
@@ -717,6 +809,208 @@ public class VastWriteFactory
             {
                 return ctr;
             }
+        }
+    }
+
+    /**
+     * Writer for MERGE INTO. Spark hands each task a mix of delete, update
+     * and insert rows; each kind is written by its own single-mode
+     * {@link VastWriter} (own queue, Arrow schema, chunk size and background
+     * writer), created on first use and all on the same transaction.
+     */
+    private class VastMergeWriter
+            implements DeltaWriter<InternalRow>
+    {
+        private final int dataWriterIndex;
+        private final Object traceObj;
+        private final String dataWriteTraceToken;
+        private final Callable<Void> txRollback;
+        private VastWriter deleteWriter;
+        private VastWriter updateWriter;
+        private VastWriter insertWriter;
+        private MutableProjection dataColumnsProjection;
+
+        private VastMergeWriter(int dataWriterIndex, Object traceObj)
+        {
+            this.dataWriterIndex = dataWriterIndex;
+            this.traceObj = traceObj;
+            this.dataWriteTraceToken = format("(%s:%s:%s)", vastTraceTokenStr,
+                    traceObj, dataWriterIndex);
+            // whichever context fails first rolls the transaction back, once
+            this.txRollback = atMostOnce(rollbackTransaction());
+        }
+
+        private VastWriter newWriter(VastWriteMode writeMode)
+        {
+            VastWriter writer = new VastWriter(dataWriterIndex,
+                    format("%s:%s", traceObj, writeMode), writeMode,
+                    txRollback);
+            DATA_WRITER_LOG.info("VastMergeWriter{} created {} context: {}",
+                    dataWriteTraceToken, writeMode, writer.name());
+            return writer;
+        }
+
+        private VastWriter deleteWriter()
+        {
+            if (deleteWriter == null) {
+                deleteWriter = newWriter(VastWriteMode.DELETE);
+            }
+            return deleteWriter;
+        }
+
+        private VastWriter updateWriter()
+        {
+            if (updateWriter == null) {
+                updateWriter = newWriter(VastWriteMode.UPDATE);
+            }
+            return updateWriter;
+        }
+
+        private VastWriter insertWriter()
+        {
+            if (insertWriter == null) {
+                insertWriter = newWriter(VastWriteMode.INSERT);
+                dataColumnsProjection = MutableProjection.create(
+                        JavaConverters
+                                .asScalaBuffer(dataColumnsReferences())
+                                .toSeq());
+            }
+            return insertWriter;
+        }
+
+        private List<VastWriter> createdWriters()
+        {
+            List<VastWriter> created = new ArrayList<>(3);
+            if (deleteWriter != null) {
+                created.add(deleteWriter);
+            }
+            if (updateWriter != null) {
+                created.add(updateWriter);
+            }
+            if (insertWriter != null) {
+                created.add(insertWriter);
+            }
+            return created;
+        }
+
+        @Override
+        public void delete(InternalRow metadata, InternalRow id)
+                throws IOException
+        {
+            deleteWriter().write(id);
+        }
+
+        @Override
+        public void update(InternalRow metadata, InternalRow id,
+                InternalRow row)
+                throws IOException
+        {
+            assertSameRowId(id, row);
+            updateWriter().write(row);
+        }
+
+        @Override
+        public void insert(InternalRow row)
+                throws IOException
+        {
+            VastWriter writer = insertWriter();
+            // drop the (null) row id slot Spark projects for inserted rows
+            writer.write(dataColumnsProjection.apply(row));
+        }
+
+        @Override
+        public void write(InternalRow row)
+                throws IOException
+        {
+            insert(row);
+        }
+
+        // Spark projects the row id both as the id row and as field 0 of the
+        // updated row (WriteDeltaProjections); they must agree, for either
+        // row id width
+        private void assertSameRowId(InternalRow id, InternalRow row)
+        {
+            if (complexRowID) {
+                Decimal idVal = id.getDecimal(0, 38, 0);
+                Decimal idValFromRow = row.getDecimal(0, 38, 0);
+                if (!Objects.equals(idVal, idValFromRow)) {
+                    throw rowIdChangedError(
+                            VASTDB_SPARK_DEC128_ROW_ID_NONNULL.getName(), idVal,
+                            idValFromRow);
+                }
+            }
+            else {
+                long idVal = id.getLong(0);
+                long idValFromRow = row.getLong(0);
+                if (idVal != idValFromRow) {
+                    throw rowIdChangedError(
+                            VASTDB_SPARK_INT64_ROW_ID_NONNULL.getName(), idVal,
+                            idValFromRow);
+                }
+            }
+        }
+
+        private IllegalStateException rowIdChangedError(String field,
+                Object origId, Object newId)
+        {
+            return new IllegalStateException(
+                    format("VastMergeWriter%s: Value of %s can not be changed: orig id: %s, new id: %s",
+                            dataWriteTraceToken, field, origId, newId));
+        }
+
+        @Override
+        public WriterCommitMessage commit()
+                throws IOException
+        {
+            List<VastWriter> created = createdWriters();
+            DATA_WRITER_LOG.info("VastMergeWriter{} commit(), contexts = {}",
+                    dataWriteTraceToken, created.size());
+            List<String> messages = new ArrayList<>(created.size());
+            for (VastWriter writer : created) {
+                messages.add(writer.commit().toString());
+            }
+            return new VastCommitMessage(
+                    format("merge writer %s contexts: %s", dataWriteTraceToken,
+                            messages));
+        }
+
+        @Override
+        public void abort()
+        {
+            DATA_WRITER_LOG.info("VastMergeWriter{} abort()",
+                    dataWriteTraceToken);
+            for (VastWriter writer : createdWriters()) {
+                writer.abort();
+            }
+        }
+
+        @Override
+        public void close()
+        {
+            DATA_WRITER_LOG.info("VastMergeWriter{} close()",
+                    dataWriteTraceToken);
+            RuntimeException failure = null;
+            for (VastWriter writer : createdWriters()) {
+                try {
+                    writer.close();
+                }
+                catch (RuntimeException e) {
+                    if (failure == null) {
+                        failure = e;
+                    }
+                    else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        public String name()
+        {
+            return format("VastMergeWriter%s", dataWriteTraceToken);
         }
     }
 }
