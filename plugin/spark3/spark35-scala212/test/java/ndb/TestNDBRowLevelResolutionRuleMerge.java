@@ -223,6 +223,27 @@ public class TestNDBRowLevelResolutionRuleMerge
         assertSame(resolved.sourceTable(), source);
     }
 
+    // Shape of a target resolved by the connector (NDBTablesResolutionRule returns a bare
+    // relation) under the alias the parser adds for an unaliased target
+    @Test
+    public void testConnectorResolvedTargetKeepsParserAlias()
+    {
+        DataSourceV2Relation relation = newDataSourceV2Relation(int64Table(), null,
+                NAMESPACE, "tgt");
+        SubqueryAlias target = new SubqueryAlias(
+                new AliasIdentifier("tgt", qualifier()), relation);
+        LocalRelation source = source(attr("k", DataTypes.IntegerType),
+                attr("v", DataTypes.StringType));
+        MergeIntoTable resolved = (MergeIntoTable) rule.apply(
+                merge(new NDBMergeTarget(target), source,
+                        seq(new UpdateStarAction(Option.empty())), seq(), seq()));
+        assertSame(resolved.targetTable(), target);
+        Attribute k = output(resolved.targetTable(), "k");
+        assertEquals(k.qualifier().last(), "tgt", "qualifier of " + k);
+        assertStarAssignments(((UpdateAction) resolved.matchedActions().apply(0)).assignments(),
+                target, source, 2);
+    }
+
     @Test
     public void testStarExpansionInt64RowId()
     {

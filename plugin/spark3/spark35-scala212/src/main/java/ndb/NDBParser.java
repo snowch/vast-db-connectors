@@ -10,6 +10,7 @@ import ndb.view.DropNDBViewPlan;
 import ndb.view.RenameNDBViewPlan;
 import ndb.view.ShowNDBViewsPlan;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.AliasIdentifier;
 import org.apache.spark.sql.catalyst.FunctionIdentifier;
 import org.apache.spark.sql.catalyst.TableIdentifier;
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation;
@@ -37,6 +38,9 @@ import scala.PartialFunction;
 import scala.PartialFunction$;
 import scala.Tuple2;
 import scala.collection.Seq;
+import scala.collection.immutable.List;
+import scala.collection.immutable.List$;
+import scala.collection.mutable.Builder;
 
 import java.util.HashSet;
 
@@ -153,13 +157,27 @@ public class NDBParser
                     merge);
             return merge;
         }
-        LogicalPlan adaptedTarget = adaptMergeTargetRelation(
-                merge.targetTable());
+        LogicalPlan target = merge.targetTable();
+        LogicalPlan adaptedTarget = adaptMergeTargetRelation(target);
         if (adaptedTarget == null) {
             LOG.warn(
                     "NDBParser.parsePlan unexpected MergeIntoTable target, leaving plan unchanged: {}",
-                    merge.targetTable());
+                    target);
             return merge;
+        }
+        if (target instanceof UnresolvedRelation) {
+            // No user alias: the relation may be resolved by NDBTablesResolutionRule,
+            // which returns it without any alias, so alias it with the plain table
+            // name to keep `table.column` references in the MERGE resolvable
+            Seq<String> plainIdentifier = removeVastResolutionSuffixes(
+                    (UnresolvedRelation) target).multipartIdentifier();
+            Builder<String, List<String>> qualifierBuilder = List$.MODULE$.newBuilder();
+            for (int i = 0; i < plainIdentifier.size() - 1; i++) {
+                qualifierBuilder.$plus$eq(plainIdentifier.apply(i));
+            }
+            adaptedTarget = new SubqueryAlias(
+                    new AliasIdentifier(plainIdentifier.last(),
+                            qualifierBuilder.result()), adaptedTarget);
         }
         MergeIntoTable adapted = merge.copy(new NDBMergeTarget(adaptedTarget),
                 merge.sourceTable(), merge.mergeCondition(),

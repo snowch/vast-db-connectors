@@ -68,6 +68,7 @@ import org.apache.spark.sql.catalyst.plans.logical.ColumnStat;
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
 import org.apache.spark.sql.catalyst.plans.logical.MergeRows;
 import org.apache.spark.sql.catalyst.plans.logical.Statistics;
+import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias;
 import org.apache.spark.sql.catalyst.plans.logical.WriteDelta;
 import org.apache.spark.sql.connector.catalog.CatalogPlugin;
 import org.apache.spark.sql.connector.catalog.Identifier;
@@ -3113,15 +3114,53 @@ public class TestVastCatalog
         try (SparkSession session = SparkTestUtils.getSession(testPort)) {
             createMergeTables(session);
             WriteDelta writeDelta = analyzeRowLevel(session,
-                    "MERGE INTO " + MERGE_TARGET + " USING " + MERGE_SOURCE + " ON tgt.k = src.k " +
-                            "WHEN MATCHED AND src.op = 'D' THEN DELETE " +
-                            "WHEN MATCHED THEN UPDATE SET v = concat(tgt.v, src.v) " +
-                            "WHEN NOT MATCHED AND src.op <> 'D' THEN INSERT (k, v) VALUES (src.k, src.v)",
+                    "MERGE INTO " + MERGE_TARGET + " USING " + MERGE_SOURCE + " s ON tgt.k = s.k " +
+                            "WHEN MATCHED AND s.op = 'D' THEN DELETE " +
+                            "WHEN MATCHED THEN UPDATE SET v = concat(tgt.v, s.v) " +
+                            "WHEN NOT MATCHED AND s.op <> 'D' THEN INSERT (k, v) VALUES (s.k, s.v)",
                     RowLevelMerge.class);
             assertMergeRowLayouts(writeDelta);
             MergeRows mergeRows = (MergeRows) writeDelta.query();
             assertEquals(mergeRows.matchedInstructions().size(), 2);
             assertEquals(mergeRows.notMatchedInstructions().size(), 1);
+        }
+    }
+
+    // On a real cluster VastCatalog.loadTable treats an empty, non-null masked-columns map as
+    // row/column security, so Spark's own ResolveRelations never resolves a VAST relation:
+    // NDBTablesResolutionRule does, and returns a bare DataSourceV2Relation with no alias.
+    // VastCatalogTestUtils answers such an empty response for every table, which reproduces
+    // that path on the mock server.
+    @Test
+    public void testMergeUnaliasedTargetResolvedByConnector()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createMergeTables(session);
+            setMergeTargetSecurity(session, "tgt", new RowColumnSecurityResponse(
+                    ImmutableList.of(), ImmutableSet.of(), ImmutableSet.of(),
+                    ImmutableMap.of()));
+            LogicalPlan select = analyzePlan(session, "SELECT * FROM " + MERGE_TARGET);
+            java.util.List<LogicalPlan> aliases = new ArrayList<>();
+            select.foreach(node -> {
+                if (node instanceof SubqueryAlias) {
+                    aliases.add(node);
+                }
+                return null;
+            });
+            assertTrue(aliases.isEmpty(), "expected the connector's bare relation: " + select);
+
+            WriteDelta writeDelta = analyzeRowLevel(session,
+                    "MERGE INTO " + MERGE_TARGET + " USING " + MERGE_SOURCE + " s ON tgt.k = s.k " +
+                            "WHEN MATCHED THEN UPDATE SET v = s.v",
+                    RowLevelMerge.class);
+            assertMergeRowLayouts(writeDelta);
+
+            session.sql("SELECT * FROM " + MERGE_SOURCE).createOrReplaceTempView("src2");
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + MERGE_TARGET + " USING src2 ON tgt.k = src2.k " +
+                            "WHEN MATCHED THEN UPDATE SET v = src2.v",
+                    RowLevelMerge.class));
         }
     }
 

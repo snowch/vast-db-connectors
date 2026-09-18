@@ -37,11 +37,15 @@ target column needs an assignment or a default; the non-nullable row id has neit
 literal would be wrapped in `AssertNotNull` and fail at run time. The rule therefore assigns a typed,
 non-null zero to the row id in every INSERT action; the writer drops that slot (§2, §3.6).
 
-**(d) Table-qualified references need the alias cleaned.** Spark aliases a resolved table with the
-identifier it looked it up by, i.e. `tgt VAST_DB_ROW_LEVEL_OP_vast_throw_rcls_error`, so
-`ON tgt.k = src.k` would not resolve for an unaliased target. The rule restores the plain name when
-it unwraps the target. (DELETE/UPDATE appear to have the same limitation today; see "Observed" in
-the PR description.)
+**(d) An unaliased target needs an alias of its own.** On a cluster `VastCatalog.loadTable` treats an
+empty, non-null masked-columns map as row/column security, so the RCLS-suffixed lookup throws and
+Spark's `ResolveRelations` never resolves a VAST relation: `NDBTablesResolutionRule` does, and returns
+a **bare** `DataSourceV2Relation` with no alias, so `ON tgt.k = s.k` cannot resolve. (On the mock
+server the lookup succeeds and Spark aliases the relation with the suffixed identifier
+`tgt VAST_DB_ROW_LEVEL_OP_vast_throw_rcls_error`, which is just as unusable.) The parser therefore
+aliases an unaliased target with its plain table name inside the marker; the rule still cleans the
+suffixed alias Spark adds on its own path. Unaliased DELETE/UPDATE/SELECT have the same limitation
+today and are out of scope; see "Observed" in the PR description.
 
 ## 2. Row layouts Spark hands the writer
 
@@ -71,6 +75,7 @@ reused per row; `QueueCtx.writeArrowRow` already copies.
    (new): a `LogicalPlan` node that delegates `output` to its child but always reports
    `resolved = false`. Spark resolves the relation inside it, but every Spark rule that touches the
    MERGE actions is guarded by `m.resolved`, so nothing happens to the actions until the marker is gone.
+   A target without a user alias is wrapped in `SubqueryAlias(<plain table name>)` first (1d).
    Insert-only merges are left untouched (1b). Source side, subqueries and CTE bodies get exactly the
    treatment a `SELECT` gets.
 5. **`NDBRowLevelResolutionRule`** — new branch, once target and source are resolved: expands
@@ -78,7 +83,8 @@ reused per row; `QueueCtx.writeArrowRow` already copies.
    with Spark's own `LogicalPlan.resolve`, i.e. the same case-sensitivity and ambiguity semantics as
    `MergeResolvePolicy.SOURCE`); refuses assignments to the row id; appends the row-id placeholder to
    every INSERT action (1c); refuses MERGE with an INSERT action on a partitioned table; cleans the
-   alias (1d); removes the marker. Spark's alignment and `RewriteMergeIntoTable` then run unchanged.
+   suffixed alias Spark adds on its own resolution path (1d); removes the marker. Spark's alignment
+   and `RewriteMergeIntoTable` then run unchanged.
    A MERGE with a CTE source sits under `WithCTE`, so the branch transforms the tree.
 6. **`NDBRCLSResolvedRelationAdaptorRule`** — `MergeIntoTable` case mirroring `UpdateTable`: a
    target resolved to `Project`/`Filter` (row filters or column masks) is refused.

@@ -23,8 +23,13 @@ the target in `NDBMergeTarget`, a plan node that reports itself unresolved: Spar
 inside it but leaves the MERGE actions alone until `NDBRowLevelResolutionRule` expands the stars over
 the data columns (values resolved against the source with Spark's own `LogicalPlan.resolve`), refuses
 assignments to the row id, adds a placeholder assignment for the row id to INSERT actions (Spark's
-alignment requires one; the writer drops the slot), restores the plain table alias, and removes the
-node. From there Spark's alignment and `RewriteMergeIntoTable` run unchanged. On the write side,
+alignment requires one; the writer drops the slot), and removes the node. From there Spark's alignment
+and `RewriteMergeIntoTable` run unchanged. An unaliased target is aliased with its plain table name at
+parse time (`SubqueryAlias(tgt, …)` inside the marker): on a cluster `VastCatalog.loadTable` treats an
+empty, non-null masked-columns map as row/column security, so Spark's `ResolveRelations` never resolves
+a VAST relation — `NDBTablesResolutionRule` does, and returns a bare relation with no alias, which left
+`ON tgt.k = s.k` unresolvable in the first cut of this PR. The rule additionally cleans the suffixed
+alias Spark adds when it resolves the relation itself (the mock server path). On the write side,
 `VastMergeWriter` owns up to three lazily created single-mode `VastWriter`s — delete, update, insert —
 on the one transaction, each with its own queue, Arrow schema, chunk size and background writer, and
 one shared rollback action that can fire at most once. A MERGE with only `WHEN NOT MATCHED` actions is
@@ -44,7 +49,7 @@ It and this file are meant to be dropped before merging.
 | `RowLevelMerge` (new) | `VastDeltaOperation` for `MERGE`, mirrors `RowLevelDelete` |
 | `VastRowLevelOperationBuilder` | `MERGE` branch |
 | `NDBMergeTarget` (new) | the unresolved marker node |
-| `NDBParser` | security wrapper also adapts `MergeIntoTable` targets |
+| `NDBParser` | security wrapper also adapts `MergeIntoTable` targets; an unaliased target is aliased with its plain table name |
 | `NDBRowLevelResolutionRule` | star expansion, row id guard, partitioned guard, alias clean-up, unwrap |
 | `NDBRCLSResolvedRelationAdaptorRule` | refuse RCLS-wrapped MERGE targets |
 | `VastBatch`, `VastPartitionedTable` | `|| isForMerge()` in the two flag readers |
@@ -72,14 +77,16 @@ New tests (TestNG, no cluster; the mock VAST server has no `QueryData`, so nothi
 * `TestVastRowLevelOperationBuilder` — `MERGE` builds `RowLevelMerge` and sets only the merge flag;
   DEC128 row id for sorted tables; `DELETE`/`UPDATE` unchanged.
 * `TestNDBParserMergeInto` — only the target is suffixed and wrapped, for aliased and unaliased
-  targets; a VAST-table source, a subquery source and a CTE source get the regular security treatment
-  only; insert-only MERGE is left alone; `WHEN NOT MATCHED BY SOURCE` takes the row-level path;
-  `DELETE`/`UPDATE` still suffix their target as before.
+  targets; an unaliased target (three-part and one-part identifiers) is aliased with its plain table
+  name, a user alias is kept as is; a VAST-table source, a subquery source and a CTE source get the
+  regular security treatment only; insert-only MERGE is left alone; `WHEN NOT MATCHED BY SOURCE`
+  takes the row-level path; `DELETE`/`UPDATE` still suffix their target as before.
 * `TestNDBRowLevelResolutionRuleMerge` — star expansion over data columns for INT64 and DEC128 row
   ids, case-insensitive column matching, missing source column error, explicit actions pass through
   with the row-id placeholder added to inserts, assignments to the row id refused (unresolved and
   resolved keys), partitioned table with INSERT refused / update-delete allowed, rule waits for
-  unresolved target or source, MERGE without the marker untouched.
+  unresolved target or source, MERGE without the marker untouched, a connector-resolved (bare)
+  target keeps the parser's alias and its `tgt` qualifier.
 * `TestVastMergeWriter` — a `VastWriteFactory` in MERGE mode with a Mockito `VastClient`: interleaved
   delete/update/insert calls with chunk size 2 end up in `deleteRows` / `updateRows` / `insertRows`
   with the right table path, the right Arrow schema (`$row_id` UInt64 or Decimal(38,0); update rows
@@ -91,8 +98,13 @@ New tests (TestNG, no cluster; the mock VAST server has no `QueryData`, so nothi
 * `TestVastCatalog.testMerge*` — the real parser and analyzer against the mock VAST server: the
   headline upsert with stars resolves to a `WriteDelta` with a `RowLevelMerge` operation and the
   expected row / row-id projections (`[row_id, k, v]` / `[row_id]`); explicit assignments with CDC
-  ordering and an unaliased target using `tgt.`/`src.` qualifiers; subquery, CTE and inline-values
-  sources; `WHEN NOT MATCHED BY SOURCE`; insert-only MERGE is an `AppendData` on a table without the
+  ordering and an unaliased target using `tgt.` qualifiers; **the cluster resolution path**
+  (`testMergeUnaliasedTargetResolvedByConnector`: `VastCatalogTestUtils` answers an empty
+  `RowColumnSecurityResponse`, so every VAST relation resolves through `NDBTablesResolutionRule` as a
+  bare relation — the test first checks a plain `SELECT` has no `SubqueryAlias`, then that
+  `MERGE INTO tgt USING src s ON tgt.k = s.k` and a temp-view source `USING src2 ON tgt.k = src2.k`
+  resolve; this test failed before the alias fix with the cluster's `UNRESOLVED_COLUMN` error);
+  subquery, CTE and inline-values sources; `WHEN NOT MATCHED BY SOURCE`; insert-only MERGE is an `AppendData` on a table without the
   row id; assignments to the row id are refused; column masks and row filters on the target are
   refused with the same message style as UPDATE; `DELETE`/`UPDATE` still resolve to
   `RowLevelDelete`/`RowLevelUpdate` with the same projections. These sit in `TestVastCatalog` because
@@ -144,7 +156,10 @@ CREATE OR REPLACE TEMP VIEW src_v AS SELECT * FROM ndb.b.s.src;
 MERGE INTO ndb.b.s.tgt t USING src_v s ON t.k = s.k WHEN MATCHED THEN UPDATE SET *;
 MERGE INTO ndb.b.s.tgt t USING (SELECT k, v, n FROM ndb.b.s.src WHERE op <> 'D') s ON t.k = s.k
 WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;
-MERGE INTO ndb.b.s.tgt USING ndb.b.s.src ON tgt.k = src.k WHEN MATCHED THEN UPDATE SET v = src.v;
+MERGE INTO ndb.b.s.tgt USING ndb.b.s.src s ON tgt.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v;
+CREATE OR REPLACE TEMP VIEW src2 AS SELECT * FROM ndb.b.s.src;
+MERGE INTO ndb.b.s.tgt USING src2 ON tgt.k = src2.k WHEN MATCHED THEN UPDATE SET v = src2.v;
+-- expected for both, from base (1,a,10) (2,b,20) (3,c,30): (1,a,10) (2,B,20) (3,C,30)
 
 -- WHEN NOT MATCHED BY SOURCE
 MERGE INTO ndb.b.s.tgt t USING ndb.b.s.src s ON t.k = s.k
@@ -156,10 +171,10 @@ MERGE INTO ndb.b.s.tgt t USING ndb.b.s.src s ON t.k = s.k WHEN MATCHED THEN UPDA
 
 -- string keys with quotes and backslashes, NULL keys, empty source
 CREATE TABLE ndb.b.s.tgt_s (k STRING, v INT);
-INSERT INTO ndb.b.s.tgt_s VALUES ('it''s', 1), ('a\\b', 2), (NULL, 3);
-MERGE INTO ndb.b.s.tgt_s t USING (SELECT 'it''s' AS k, 10 AS v UNION ALL SELECT 'a\\b', 20 UNION ALL SELECT NULL, 30) s
+INSERT INTO ndb.b.s.tgt_s VALUES ('it\'s', 1), ('a\\b', 2), (NULL, 3);
+MERGE INTO ndb.b.s.tgt_s t USING (SELECT 'it\'s' AS k, 10 AS v UNION ALL SELECT 'a\\b', 20 UNION ALL SELECT NULL, 30) s
 ON t.k = s.k WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;
--- expected: ('it''s',10) ('a\b',20) (NULL,3) (NULL,30)   (NULL never matches)
+-- expected: (it's,10) (a\b,20) (NULL,3) (NULL,30)   (NULL never matches)
 MERGE INTO ndb.b.s.tgt t USING (SELECT * FROM ndb.b.s.src WHERE 1 = 0) s ON t.k = s.k
 WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;   -- no-op
 
@@ -228,9 +243,16 @@ Things a maintainer should know:
   `partitionedCtxs` machinery with an empty key whenever `partitioned_insert` is on (the default).
 * `NDBCommon.vastClient` is a static singleton not reset by `clearConfig()`; tests that need a mock
   server must share `TestVastCatalog`'s.
-* Spark aliases a resolved table with the suffixed lookup identifier, so table-qualified references
-  to an unaliased DELETE/UPDATE target do not resolve today. Verified against the mock server with a
-  throwaway test (not kept): `DELETE FROM ndb.buck.schem.tgt WHERE tgt.k = 1` and
-  `UPDATE ndb.buck.schem.tgt SET v = 'x' WHERE tgt.k = 1` fail with `UNRESOLVED_COLUMN` (Spark suggests
-  ``tgt VAST_DB_ROW_LEVEL_OP`.`k``), `DELETE FROM ndb.buck.schem.tgt AS t WHERE t.k = 1` works. MERGE
-  restores the plain alias for its target, so `ON tgt.k = s.k` works; DELETE/UPDATE are left as they are.
+* Table-qualified references to an unaliased VAST relation do not resolve today. On a cluster
+  `NDBTablesResolutionRule` resolves every VAST relation to a bare relation with no alias, so
+  `SELECT src.v FROM ndb.b.s.src` fails, and so does an aliased-target MERGE with an unaliased VAST
+  source (`MERGE INTO ndb.b.s.tgt t USING ndb.b.s.src ON t.k = src.k`). On the Spark resolution path
+  (mock server) the alias carries the suffixed lookup identifier, so unaliased DELETE/UPDATE targets
+  fail the same way: `DELETE FROM ndb.buck.schem.tgt WHERE tgt.k = 1` and
+  `UPDATE ndb.buck.schem.tgt SET v = 'x' WHERE tgt.k = 1` give `UNRESOLVED_COLUMN` (Spark suggests
+  ``tgt VAST_DB_ROW_LEVEL_OP`.`k``), `DELETE FROM ndb.buck.schem.tgt AS t WHERE t.k = 1` works
+  (verified with a throwaway test, not kept). This PR only aliases the MERGE target; sources,
+  SELECT, DELETE and UPDATE are left as they are.
+* With `spark.ndb.max_row_count_per_insert=5000`, a plain 300k-row `INSERT` stores 20,000 all-NULL rows
+  and loses 20,000 real ones (found on a cluster while testing this PR). Upstream `master` behaves the
+  same and the default chunk size is fine, so it is not caused by this PR; it is reported separately.

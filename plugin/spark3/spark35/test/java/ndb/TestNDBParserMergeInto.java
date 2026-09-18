@@ -22,7 +22,9 @@ import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Listeners;
 import org.testng.annotations.Test;
+import scala.collection.immutable.List$;
 import scala.collection.immutable.Seq;
+import scala.collection.mutable.Builder;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -61,6 +63,15 @@ public class TestNDBParserMergeInto
         return (UnresolvedRelation) plan;
     }
 
+    private static Seq<String> seq(String... parts)
+    {
+        Builder<String, scala.collection.immutable.List<String>> builder = List$.MODULE$.newBuilder();
+        for (String part : parts) {
+            builder.$plus$eq(part);
+        }
+        return builder.result();
+    }
+
     private static MergeIntoTable mergeOf(LogicalPlan plan)
     {
         if (plan instanceof UnresolvedWith) {
@@ -96,6 +107,9 @@ public class TestNDBParserMergeInto
         LogicalPlan target = ((NDBMergeTarget) merge.targetTable()).child();
         assertTrue(target instanceof SubqueryAlias);
         assertEquals(((SubqueryAlias) target).alias(), "t");
+        // a user alias is kept as is, no second alias is added under it
+        assertTrue(((SubqueryAlias) target).child() instanceof UnresolvedRelation,
+                "target: " + target);
         assertEquals(identifier(relationOf(target)),
                 List.of("ndb", "buck", "schem", ROW_LEVEL_OP_TARGET));
         // the source gets the regular (SELECT) security treatment only
@@ -116,12 +130,33 @@ public class TestNDBParserMergeInto
                 "MERGE INTO ndb.buck.schem.tgt USING ndb.buck.schem.src ON tgt.k = src.k " +
                         "WHEN MATCHED THEN DELETE"));
         assertTrue(merge.targetTable() instanceof NDBMergeTarget);
+        // without a user alias the target is aliased with its plain table name, so that
+        // `tgt.column` resolves whichever rule ends up resolving the relation
         LogicalPlan target = ((NDBMergeTarget) merge.targetTable()).child();
-        assertTrue(target instanceof UnresolvedRelation);
-        assertEquals(identifier((UnresolvedRelation) target),
+        assertTrue(target instanceof SubqueryAlias, "target: " + target);
+        SubqueryAlias alias = (SubqueryAlias) target;
+        assertEquals(alias.alias(), "tgt");
+        assertEquals(alias.identifier().qualifier(), seq("ndb", "buck", "schem"));
+        assertTrue(alias.child() instanceof UnresolvedRelation, "target: " + target);
+        assertEquals(identifier((UnresolvedRelation) alias.child()),
                 List.of("ndb", "buck", "schem", ROW_LEVEL_OP_TARGET));
         assertEquals(identifier(relationOf(merge.sourceTable())),
                 List.of("ndb", "buck", "schem", RCLS_SOURCE));
+    }
+
+    @Test
+    public void testUnaliasedOnePartTarget()
+            throws ParseException
+    {
+        MergeIntoTable merge = mergeOf(parser.parsePlan(
+                "MERGE INTO tgt USING src s ON tgt.k = s.k WHEN MATCHED THEN DELETE"));
+        LogicalPlan target = ((NDBMergeTarget) merge.targetTable()).child();
+        assertTrue(target instanceof SubqueryAlias, "target: " + target);
+        SubqueryAlias alias = (SubqueryAlias) target;
+        assertEquals(alias.alias(), "tgt");
+        assertTrue(alias.identifier().qualifier().isEmpty());
+        assertEquals(identifier((UnresolvedRelation) alias.child()),
+                List.of(ROW_LEVEL_OP_TARGET));
     }
 
     @Test
