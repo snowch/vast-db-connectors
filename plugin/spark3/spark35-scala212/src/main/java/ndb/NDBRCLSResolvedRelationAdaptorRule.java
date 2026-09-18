@@ -76,28 +76,31 @@ public class NDBRCLSResolvedRelationAdaptorRule
             else if (p instanceof DeleteFromTable) {
                 DeleteFromTable delete = (DeleteFromTable) p;
                 LogicalPlan child = delete.child();
-                if (!(child instanceof DataSourceV2Relation)) {
-                    if (child instanceof Project) {
+                // Look through the alias(es) of the target, as Spark's RewriteDeleteFromTable
+                // does; they are kept, so that `table.column` references in the condition
+                // resolve.
+                LogicalPlan relation = EliminateSubqueryAliases.apply(child);
+                if (!(relation instanceof DataSourceV2Relation)) {
+                    if (relation instanceof Project) {
                         throw new VastRuntimeException(
                                 "Delete from table is not allowed by current VAST security policy rules",
                                 null, ErrorType.USER);
                     }
-                    if (child instanceof Filter) {
-                        Filter filterNode = (Filter) child;
+                    if (relation instanceof Filter) {
+                        Filter filterNode = (Filter) relation;
                         And combinedFilter = new And(delete.condition(),
                                 filterNode.condition());
-                        return delete.copy(filterNode.child(), combinedFilter);
-                    }
-                    else if (child instanceof SubqueryAlias) {
-                        SubqueryAlias subqueryAlias = (SubqueryAlias) child;
-                        LogicalPlan subqueryChild = EliminateSubqueryAliases.apply(
-                                subqueryAlias);
-                        return delete.copy(subqueryChild, delete.condition());
+                        Function1<LogicalPlan, LogicalPlan> filterRemover = node -> node == filterNode ?
+                                filterNode.child() :
+                                node;
+                        LogicalPlan withoutFilter = child.transformUp(
+                                PartialFunction$.MODULE$.apply(filterRemover));
+                        return delete.copy(withoutFilter, combinedFilter);
                     }
                     else {
                         throw new VastRuntimeException(
                                 format("Unexpected child class for %s: %s. plan: %s",
-                                        p.getClass(), child.getClass(), p),
+                                        p.getClass(), relation.getClass(), p),
                                 null, ErrorType.GENERAL);
                     }
                 }
@@ -128,10 +131,15 @@ public class NDBRCLSResolvedRelationAdaptorRule
         return plan.transformUp(PartialFunction$.MODULE$.apply(rclsRemover));
     }
 
+    // Spark aliases a relation it resolves with the lookup identifier: restore the plain table
+    // name, so that `table.column` references resolve for row level operations as well
     private AliasIdentifier adaptIdentifier(AliasIdentifier identifier)
     {
         String adaptedName = identifier.name().substring(0,
                 identifier.name().indexOf(VAST_THROW_RCLS_ERROR));
+        if (isForRowLevelOp(adaptedName)) {
+            adaptedName = trimTableNameFromRowLevelOpSuffix(adaptedName);
+        }
         Seq<String> qualifier = identifier.qualifier();
         return new AliasIdentifier(adaptedName, qualifier);
     }

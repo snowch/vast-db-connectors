@@ -29,6 +29,8 @@ import com.vastdata.mockserver.VastMockS3Server;
 import com.vastdata.mockserver.VastRootHandler;
 import com.vastdata.mockserver.handle.MockSchemaUtil;
 import com.vastdata.spark.CommonSparkTestUtils;
+import com.vastdata.spark.RowLevelDelete;
+import com.vastdata.spark.RowLevelUpdate;
 import com.vastdata.spark.SparkTestUtils;
 import com.vastdata.spark.VastArrowAllocator;
 import com.vastdata.spark.VastScan;
@@ -59,19 +61,30 @@ import org.apache.spark.sql.catalyst.expressions.AttributeMap$;
 import org.apache.spark.sql.catalyst.expressions.AttributeReference;
 import org.apache.spark.sql.catalyst.expressions.AttributeSet;
 import org.apache.spark.sql.catalyst.expressions.ExprId;
+import org.apache.spark.sql.catalyst.parser.ParseException;
+import org.apache.spark.sql.catalyst.plans.logical.AppendData;
 import org.apache.spark.sql.catalyst.plans.logical.ColumnStat;
+import org.apache.spark.sql.catalyst.plans.logical.Filter;
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
+import org.apache.spark.sql.catalyst.plans.logical.Project;
 import org.apache.spark.sql.catalyst.plans.logical.Statistics;
+import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias;
+import org.apache.spark.sql.catalyst.plans.logical.WriteDelta;
 import org.apache.spark.sql.connector.catalog.CatalogPlugin;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableChange;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.connector.write.RowLevelOperation;
+import org.apache.spark.sql.connector.write.RowLevelOperationTable;
+import org.apache.spark.sql.execution.CommandExecutionMode$;
 import org.apache.spark.sql.execution.FilterExec;
 import org.apache.spark.sql.execution.ProjectExec;
 import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec;
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
 import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
@@ -102,8 +115,10 @@ import scala.math.BigInt;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -2942,6 +2957,423 @@ public class TestVastCatalog
                     .show())
                             .isInstanceOf(VastRuntimeException.class)
                             .hasMessageContaining("Access Denied");
+        }
+    }
+
+    // ---- Relations resolved by the connector carry their table name as an alias ----
+    //
+    // Spark's ResolveRelations aliases every relation it resolves with `catalog.namespace.table`.
+    // NDBTablesResolutionRule, which resolves a VAST relation whenever VastCatalog.loadTable
+    // refuses the RCLS-suffixed lookup (a real cluster), used to return the bare relation, so
+    // `table.column` references did not resolve. The tests below analyze statements with the real
+    // analyzer (CommandExecutionMode.SKIP: nothing executes, the mock server has no QueryData) and
+    // run on that path unless they say otherwise; the row/column security policy for DELETE and
+    // UPDATE is unchanged.
+
+    private static final String TARGET_TABLE = "ndb.buck.schem.tgt";
+    private static final String SOURCE_TABLE = "ndb.buck.schem.src";
+    private static final String FILTERED_TABLE = TARGET_TABLE + "_filtered";
+    private static final String MASKED_TABLE = TARGET_TABLE + "_masked";
+
+    private static java.util.List<String> outputNames(LogicalPlan plan)
+    {
+        java.util.List<String> names = new ArrayList<>();
+        for (int i = 0; i < plan.output().size(); i++) {
+            names.add(plan.output().apply(i).name());
+        }
+        return names;
+    }
+
+    private static java.util.List<String> fieldNames(StructType schema)
+    {
+        return java.util.List.of(schema.fieldNames());
+    }
+
+    private static LogicalPlan analyzePlan(SparkSession session, String sql)
+    {
+        LogicalPlan parsed;
+        try {
+            parsed = session.sessionState().sqlParser().parsePlan(sql);
+        }
+        catch (ParseException e) {
+            throw new RuntimeException(e);
+        }
+        return session
+                .sessionState()
+                .executePlan(parsed, CommandExecutionMode$.MODULE$.SKIP())
+                .analyzed();
+    }
+
+    private static WriteDelta analyzeRowLevel(SparkSession session, String sql,
+            Class<? extends RowLevelOperation> expectedOperation)
+    {
+        LogicalPlan analyzed = analyzePlan(session, sql);
+        assertTrue(analyzed instanceof WriteDelta, "analyzed plan: " + analyzed);
+        WriteDelta writeDelta = (WriteDelta) analyzed;
+        DataSourceV2Relation relation = (DataSourceV2Relation) writeDelta.table();
+        assertTrue(relation.table() instanceof RowLevelOperationTable,
+                "table: " + relation.table());
+        RowLevelOperationTable operationTable = (RowLevelOperationTable) relation.table();
+        assertTrue(expectedOperation.isInstance(operationTable.operation()),
+                "operation: " + operationTable.operation());
+        return writeDelta;
+    }
+
+    private void createAliasTestTables(SparkSession session)
+    {
+        try {
+            new MockUtils().createBucket(this.testPort, "buck");
+        }
+        catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        session.sql("CREATE DATABASE ndb.buck.schem").show();
+        session.sql("CREATE TABLE " + TARGET_TABLE + " (k int, v string)").show();
+        session.sql("CREATE TABLE " + FILTERED_TABLE + " (k int, v string)").show();
+        session.sql("CREATE TABLE " + MASKED_TABLE + " (k int, v string)").show();
+        session.sql("CREATE TABLE " + SOURCE_TABLE + " (k int, v string, op string)").show();
+    }
+
+    private static RowColumnSecurityResponse rowFilter()
+    {
+        return new RowColumnSecurityResponse(ImmutableList.of("k > 10"),
+                ImmutableSet.of(), ImmutableSet.of(), ImmutableMap.of());
+    }
+
+    private static RowColumnSecurityResponse columnMask()
+    {
+        return new RowColumnSecurityResponse(ImmutableList.of(), ImmutableSet.of(),
+                ImmutableSet.of(), ImmutableMap.of("v", "regexp_replace(v, '[0-9]', '***')"));
+    }
+
+    // Installs VastCatalogTestUtils, which answers an empty, non-null row/column security
+    // response for every table: VastCatalog.loadTable then refuses every RCLS-suffixed lookup
+    // and NDBTablesResolutionRule resolves the relations, as on a real cluster
+    private VastCatalogTestUtils connectorResolution(SparkSession session)
+            throws VastUserException
+    {
+        VastCatalog vastCatalog = (VastCatalog) session
+                .sessionState()
+                .catalogManager()
+                .catalog("ndb");
+        VastConfig vastConfig = NDB.getConfig();
+        VastClient vastClient = NDB.getVastClient(vastConfig);
+        VastCatalogTestUtils vastCatalogTestUtils = new VastCatalogTestUtils(
+                vastConfig, vastClient,
+                VastSparkTransactionsManager.getInstance(vastClient,
+                        new VastTransactionFactory()));
+        vastCatalog.setVastCatalogUtils(vastCatalogTestUtils);
+        InitializedVastCatalog.setVastCatalog(vastCatalog);
+        return vastCatalogTestUtils;
+    }
+
+    private static java.util.List<SubqueryAlias> aliasesIn(LogicalPlan plan)
+    {
+        java.util.List<SubqueryAlias> aliases = new ArrayList<>();
+        plan.foreach(node -> {
+            if (node instanceof SubqueryAlias) {
+                aliases.add((SubqueryAlias) node);
+            }
+            return null;
+        });
+        return aliases;
+    }
+
+    private static java.util.List<String> qualifierOf(SubqueryAlias alias)
+    {
+        java.util.List<String> parts = new ArrayList<>();
+        Seq<String> qualifier = alias.identifier().qualifier();
+        for (int i = 0; i < qualifier.size(); i++) {
+            parts.add(qualifier.apply(i));
+        }
+        return parts;
+    }
+
+    private static SubqueryAlias aliasNamed(LogicalPlan plan, String name)
+    {
+        for (SubqueryAlias alias : aliasesIn(plan)) {
+            if (alias.alias().equals(name)) {
+                return alias;
+            }
+        }
+        throw new AssertionError("no alias " + name + " in " + plan);
+    }
+
+    // the alias a resolved VAST relation carries: its plain table name, qualified by the catalog
+    // and the namespace, exactly as Spark's ResolveRelations aliases a relation
+    private static SubqueryAlias connectorAlias(LogicalPlan plan, String table)
+    {
+        SubqueryAlias alias = aliasNamed(plan, table);
+        assertEquals(qualifierOf(alias), java.util.List.of("ndb", "buck", "schem"),
+                "qualifier of " + alias);
+        return alias;
+    }
+
+    private static String relationName(LogicalPlan plan)
+    {
+        return plan instanceof DataSourceV2Relation ?
+                ((DataSourceV2Relation) plan).identifier().get().name() :
+                "";
+    }
+
+    // the policy's row filter, directly above the table's relation
+    private static boolean hasRowFilterOver(LogicalPlan plan, String table)
+    {
+        java.util.List<LogicalPlan> found = new ArrayList<>();
+        plan.foreach(node -> {
+            if (node instanceof Filter && ((Filter) node).condition().toString().contains("> 10")
+                    && relationName(((Filter) node).child()).equals(table)) {
+                found.add(node);
+            }
+            return null;
+        });
+        return !found.isEmpty();
+    }
+
+    // the policy's column mask, directly above the table's relation
+    private static boolean hasColumnMaskOver(LogicalPlan plan, String table)
+    {
+        java.util.List<LogicalPlan> found = new ArrayList<>();
+        plan.foreach(node -> {
+            if (node instanceof Project
+                    && ((Project) node).projectList().toString().contains("regexp_replace")
+                    && relationName(((Project) node).child()).equals(table)) {
+                found.add(node);
+            }
+            return null;
+        });
+        return !found.isEmpty();
+    }
+
+    private static void assertRefused(SparkSession session, String sql, String message)
+    {
+        assertThatThrownBy(() -> analyzePlan(session, sql))
+                .as(sql)
+                .isInstanceOf(VastRuntimeException.class)
+                .hasMessageContaining(message);
+    }
+
+    @Test
+    public void testConnectorResolvedRelationIsAliasedWithItsTableName()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            connectorResolution(session);
+            LogicalPlan select = analyzePlan(session,
+                    "SELECT tgt.k, schem.tgt.v, buck.schem.tgt.k, ndb.buck.schem.tgt.v " +
+                            "FROM " + TARGET_TABLE + " WHERE tgt.k > 0");
+            assertEquals(outputNames(select), java.util.List.of("k", "v", "k", "v"));
+            assertEquals(aliasesIn(select).size(), 1, "aliases in " + select);
+            SubqueryAlias alias = connectorAlias(select, "tgt");
+            assertTrue(alias.child() instanceof DataSourceV2Relation, "under the alias: " + alias);
+            DataSourceV2Relation relation = (DataSourceV2Relation) alias.child();
+            // the lookup suffixes are gone from the relation identifier as well
+            assertEquals(relation.identifier().get().name(), "tgt");
+            assertEquals(outputNames(relation), java.util.List.of("k", "v"));
+            // a relative name resolves to the same alias
+            session.sql("USE ndb.buck.schem").show();
+            connectorAlias(analyzePlan(session, "SELECT tgt.k FROM tgt"), "tgt");
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedJoinByTableNames()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            connectorResolution(session);
+            LogicalPlan join = analyzePlan(session,
+                    "SELECT tgt.k, src.v, src.op FROM " + TARGET_TABLE + " JOIN " + SOURCE_TABLE +
+                            " ON tgt.k = src.k WHERE src.op <> 'D'");
+            assertEquals(outputNames(join), java.util.List.of("k", "v", "op"));
+            connectorAlias(join, "tgt");
+            connectorAlias(join, "src");
+            // a user alias sits above the connector's alias and hides the table name
+            LogicalPlan selfJoin = analyzePlan(session,
+                    "SELECT a.k, b.v FROM " + TARGET_TABLE + " a JOIN " + TARGET_TABLE + " b ON a.k = b.k");
+            assertEquals(aliasesIn(selfJoin).size(), 4, "aliases in " + selfJoin);
+            assertTrue(aliasNamed(selfJoin, "a").child() instanceof SubqueryAlias,
+                    "under alias a: " + aliasNamed(selfJoin, "a"));
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "SELECT tgt.k FROM " + TARGET_TABLE + " a JOIN " + TARGET_TABLE + " b ON a.k = b.k"))
+                    .isInstanceOf(AnalysisException.class);
+        }
+    }
+
+    // A relation with a row filter or a column mask keeps its wrapper under the alias, wherever
+    // it is read from: a plain SELECT, a join, a subquery, the query of an INSERT
+    @Test
+    public void testConnectorResolvedFilteredAndMaskedRelationsKeepTheirWrappersUnderTheAlias()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            VastCatalogTestUtils utils = connectorResolution(session);
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_filtered", rowFilter());
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_masked", columnMask());
+            SubqueryAlias filtered = connectorAlias(analyzePlan(session,
+                    "SELECT tgt_filtered.k FROM " + FILTERED_TABLE + " WHERE tgt_filtered.k < 100"),
+                    "tgt_filtered");
+            assertTrue(filtered.child() instanceof Filter, "under the alias: " + filtered);
+            Filter filter = (Filter) filtered.child();
+            assertTrue(filter.condition().toString().contains("> 10"), "row filter: " + filter);
+            assertTrue(filter.child() instanceof DataSourceV2Relation, "under the filter: " + filter);
+            SubqueryAlias masked = connectorAlias(analyzePlan(session,
+                    "SELECT tgt_masked.v FROM " + MASKED_TABLE), "tgt_masked");
+            assertTrue(masked.child() instanceof Project, "under the alias: " + masked);
+            Project mask = (Project) masked.child();
+            assertTrue(mask.projectList().apply(1).toString().contains("regexp_replace"),
+                    "column mask: " + mask);
+            assertTrue(mask.child() instanceof DataSourceV2Relation, "under the mask: " + mask);
+
+            LogicalPlan join = analyzePlan(session,
+                    "SELECT t.k, tgt_filtered.v FROM " + TARGET_TABLE + " t JOIN " + FILTERED_TABLE +
+                            " ON t.k = tgt_filtered.k");
+            assertTrue(hasRowFilterOver(join, "tgt_filtered"), "join plan: " + join);
+            LogicalPlan subquery = analyzePlan(session,
+                    "SELECT s.k FROM (SELECT tgt_masked.k, tgt_masked.v FROM " + MASKED_TABLE + ") s " +
+                            "WHERE s.v = 'x'");
+            assertTrue(hasColumnMaskOver(subquery, "tgt_masked"), "subquery plan: " + subquery);
+            LogicalPlan insert = analyzePlan(session,
+                    "INSERT INTO " + TARGET_TABLE + " SELECT tgt_filtered.k, tgt_filtered.v FROM " + FILTERED_TABLE);
+            assertTrue(insert instanceof AppendData, "analyzed plan: " + insert);
+            assertTrue(hasRowFilterOver(((AppendData) insert).query(), "tgt_filtered"),
+                    "append plan: " + insert);
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedDeleteAndUpdateByTableName()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            connectorResolution(session);
+            for (String where : new String[] {"k = 1", "tgt.k = 1", "schem.tgt.k = 1"}) {
+                WriteDelta delete = analyzeRowLevel(session,
+                        "DELETE FROM " + TARGET_TABLE + " WHERE " + where, RowLevelDelete.class);
+                assertEquals(fieldNames(delete.projections().rowIdProjection().schema()),
+                        java.util.List.of(SPARK_INT64_ROW_ID_FIELD.name()));
+                WriteDelta update = analyzeRowLevel(session,
+                        "UPDATE " + TARGET_TABLE + " SET v = concat(tgt.v, 'x') WHERE " + where,
+                        RowLevelUpdate.class);
+                assertEquals(fieldNames(update.projections().rowProjection().get().schema()),
+                        java.util.List.of(SPARK_INT64_ROW_ID_FIELD.name(), "k", "v"));
+            }
+            // a user alias still works, and hides the table name
+            analyzeRowLevel(session, "DELETE FROM " + TARGET_TABLE + " AS t WHERE t.k = 1",
+                    RowLevelDelete.class);
+            analyzeRowLevel(session, "UPDATE " + TARGET_TABLE + " AS t SET v = 'x' WHERE t.k = 1",
+                    RowLevelUpdate.class);
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "DELETE FROM " + TARGET_TABLE + " AS t WHERE tgt.k = 1"))
+                    .isInstanceOf(AnalysisException.class);
+        }
+    }
+
+    // The row/column security outcome must not depend on the aliases above the target (the
+    // connector's, a user's, or both): a row filter is merged into a DELETE and refused for
+    // UPDATE, a column mask is refused for both, with the existing messages.
+    @Test
+    public void testConnectorResolvedRowLevelSecurityOutcomesForAliasedAndUnaliasedTargets()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            VastCatalogTestUtils utils = connectorResolution(session);
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_filtered", rowFilter());
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_masked", columnMask());
+            // {target suffix, qualifier of the filtered table's columns, of the masked table's}
+            String[][] forms = {{"", "", ""}, {"", "tgt_filtered.", "tgt_masked."}, {" AS t", "t.", "t."}};
+            for (String[] form : forms) {
+                String filtered = FILTERED_TABLE + form[0];
+                String masked = MASKED_TABLE + form[0];
+                String fq = form[1];
+                String mq = form[2];
+                WriteDelta delete = analyzeRowLevel(session,
+                        "DELETE FROM " + filtered + " WHERE " + fq + "k = 1", RowLevelDelete.class);
+                String condition = delete.condition().toString();
+                assertTrue(condition.contains("= 1") && condition.contains("> 10"),
+                        "delete condition for " + filtered + ": " + condition);
+                assertRefused(session, "DELETE FROM " + masked + " WHERE " + mq + "k = 1",
+                        "Delete from table is not allowed by current VAST security policy rules");
+                assertRefused(session, "UPDATE " + filtered + " SET v = 'x' WHERE " + fq + "k = 1",
+                        "Update table is not allowed by current VAST security policy rules");
+                assertRefused(session, "UPDATE " + masked + " SET v = 'x' WHERE " + mq + "k = 1",
+                        "Update table is not allowed by current VAST security policy rules");
+            }
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedInsertKeepsBareTargetAndAliasedSource()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            connectorResolution(session);
+            LogicalPlan analyzed = analyzePlan(session,
+                    "INSERT INTO " + TARGET_TABLE + " SELECT src.k, src.v FROM " + SOURCE_TABLE);
+            assertTrue(analyzed instanceof AppendData, "analyzed plan: " + analyzed);
+            AppendData append = (AppendData) analyzed;
+            assertTrue(append.table() instanceof DataSourceV2Relation, "target: " + append.table());
+            assertTrue(((DataSourceV2Relation) append.table()).table() instanceof VastTable);
+            connectorAlias(append.query(), "src");
+        }
+    }
+
+    @Test
+    public void testConnectorResolvedViewQueryCanUseTableNames()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            connectorResolution(session);
+            String viewQuery = "SELECT tgt.k AS key, tgt.v FROM " + TARGET_TABLE + " WHERE tgt.k > 0";
+            StructType viewSchema = new StructType(new StructField[] {
+                    new StructField("key", DataTypes.IntegerType, true, Metadata.empty()),
+                    new StructField("v", DataTypes.StringType, true, Metadata.empty())});
+            when(mockViewMetadataReader.getVastView(
+                    nullable(SimpleVastTransaction.class), nullable(String.class),
+                    nullable(String.class), nullable(String[].class), anyList(),
+                    nullable(VastSchedulingInfo.class), nullable(String.class)))
+                    .thenReturn(new VastView("v1", viewQuery, "ndb", "",
+                            new String[] {"buck", "schem"}, viewSchema, new String[0],
+                            new String[0], new String[0]));
+            when(mockViewMetadataReaderFactory.instance()).thenReturn(mockViewMetadataReader);
+            VastCatalog vastCatalog = (VastCatalog) session
+                    .sessionState()
+                    .catalogManager()
+                    .catalog("ndb");
+            vastCatalog.setSparkViewsMetadataReaderFactory(mockViewMetadataReaderFactory);
+            // the view definition is analyzed on creation, and again on every use
+            session.sql("CREATE VIEW ndb.buck.schem.v1 AS " + viewQuery).show();
+            LogicalPlan select = analyzePlan(session,
+                    "SELECT v1.key, v1.v FROM ndb.buck.schem.v1 WHERE v1.key = 1");
+            assertEquals(outputNames(select), java.util.List.of("key", "v"));
+            SubqueryAlias view = aliasNamed(select, "v1");
+            connectorAlias(view.child(), "tgt");
+        }
+    }
+
+    // Without row/column security answers (the default on the mock server) Spark resolves the
+    // relation itself and aliases it with the lookup identifier, which carries the resolution
+    // suffixes: NDBRCLSResolvedRelationAdaptorRule restores the plain table name.
+    @Test
+    public void testSparkResolvedRelationsByTableName()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            SubqueryAlias alias = connectorAlias(
+                    analyzePlan(session, "SELECT * FROM " + TARGET_TABLE), "tgt");
+            assertTrue(alias.child() instanceof DataSourceV2Relation, "under the alias: " + alias);
+            analyzeRowLevel(session, "DELETE FROM " + TARGET_TABLE + " WHERE tgt.k = 1",
+                    RowLevelDelete.class);
+            analyzeRowLevel(session,
+                    "UPDATE " + TARGET_TABLE + " SET v = concat(tgt.v, 'x') WHERE tgt.k = 1",
+                    RowLevelUpdate.class);
         }
     }
 }
