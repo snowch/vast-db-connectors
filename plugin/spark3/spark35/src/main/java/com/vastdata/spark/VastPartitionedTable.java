@@ -249,7 +249,7 @@ public class VastPartitionedTable
                     tableMD.tableName, info.queryId(), info.schema(),
                     info.options().asCaseSensitiveMap());
 
-            if (tableMD.isForDelete() || tableMD.isForUpdate() || tableMD.forImportData) {
+            if (tableMD.isForDelete() || tableMD.isForUpdate() || tableMD.isForMerge() || tableMD.forImportData) {
                 return new VastWriteBuilder(clientSupplier.get(), this);
             }
 

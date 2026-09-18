@@ -13,6 +13,7 @@ import org.apache.spark.sql.catalyst.expressions.AttributeReference;
 import org.apache.spark.sql.catalyst.plans.logical.DeleteFromTable;
 import org.apache.spark.sql.catalyst.plans.logical.Filter;
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
+import org.apache.spark.sql.catalyst.plans.logical.MergeIntoTable;
 import org.apache.spark.sql.catalyst.plans.logical.Project;
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias;
 import org.apache.spark.sql.catalyst.plans.logical.UpdateTable;
@@ -124,6 +125,21 @@ public class NDBRCLSResolvedRelationAdaptorRule
                                 ErrorType.GENERAL);
                     }
 
+                }
+            }
+            else if (p instanceof MergeIntoTable) {
+                // Same policy as UpdateTable: a target wrapped with row filters
+                // or column masks is refused. Any other shape is left for the
+                // regular resolution to handle.
+                LogicalPlan target = ((MergeIntoTable) p).targetTable();
+                if (target instanceof NDBMergeTarget) {
+                    target = ((NDBMergeTarget) target).child();
+                }
+                target = EliminateSubqueryAliases.apply(target);
+                if (target instanceof Project || target instanceof Filter) {
+                    throw new VastRuntimeException(
+                            "Merge into table is not allowed by current VAST security policy rules",
+                            null, ErrorType.USER);
                 }
             }
             return p;

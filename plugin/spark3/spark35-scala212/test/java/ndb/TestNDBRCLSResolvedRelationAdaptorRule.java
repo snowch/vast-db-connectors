@@ -8,23 +8,30 @@ import com.vastdata.client.error.VastRuntimeException;
 import com.vastdata.spark.CommonSparkTestUtils;
 import com.vastdata.spark.VastTable;
 import org.apache.spark.sql.catalyst.AliasIdentifier;
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute;
 import org.apache.spark.sql.catalyst.expressions.And;
 import org.apache.spark.sql.catalyst.expressions.Attribute;
+import org.apache.spark.sql.catalyst.expressions.AttributeReference;
 import org.apache.spark.sql.catalyst.expressions.EqualTo;
 import org.apache.spark.sql.catalyst.expressions.Expression;
 import org.apache.spark.sql.catalyst.expressions.GreaterThan;
 import org.apache.spark.sql.catalyst.expressions.Literal;
 import org.apache.spark.sql.catalyst.expressions.NamedExpression;
 import org.apache.spark.sql.catalyst.plans.logical.Assignment;
+import org.apache.spark.sql.catalyst.plans.logical.DeleteAction;
 import org.apache.spark.sql.catalyst.plans.logical.DeleteFromTable;
 import org.apache.spark.sql.catalyst.plans.logical.Filter;
+import org.apache.spark.sql.catalyst.plans.logical.LocalRelation;
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
+import org.apache.spark.sql.catalyst.plans.logical.MergeAction;
+import org.apache.spark.sql.catalyst.plans.logical.MergeIntoTable;
 import org.apache.spark.sql.catalyst.plans.logical.Project;
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias;
 import org.apache.spark.sql.catalyst.plans.logical.UpdateTable;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.testng.annotations.Listeners;
@@ -38,6 +45,8 @@ import scala.collection.mutable.Builder;
 import java.util.Map;
 import java.util.Optional;
 
+import static com.vastdata.spark.SparkPlannerUtil.getEmptyInternalRowSeq;
+import static com.vastdata.spark.SparkPlannerUtil.getEmptyStringSeq;
 import static ndb.SparkPlannerUtil.newAlias;
 import static ndb.SparkPlannerUtil.newDataSourceV2Relation;
 import static ndb.view.NDBTablesResolutionRule.VAST_THROW_RCLS_ERROR;
@@ -58,6 +67,7 @@ public class TestNDBRCLSResolvedRelationAdaptorRule
     private static final String ROW_LEVEL_OP_LOOKUP_NAME = "tgt VAST_DB_ROW_LEVEL_OP" + VAST_THROW_RCLS_ERROR;
     private static final String DELETE_REFUSED = "Delete from table is not allowed by current VAST security policy rules";
     private static final String UPDATE_REFUSED = "Update table is not allowed by current VAST security policy rules";
+    private static final String MERGE_REFUSED = "Merge into table is not allowed by current VAST security policy rules";
 
     private final NDBRCLSResolvedRelationAdaptorRule rule = new NDBRCLSResolvedRelationAdaptorRule();
 
@@ -96,6 +106,24 @@ public class TestNDBRCLSResolvedRelationAdaptorRule
     {
         return new SubqueryAlias(new AliasIdentifier(name,
                 TestNDBRCLSResolvedRelationAdaptorRule.<String>seq()), child);
+    }
+
+    private static LocalRelation source()
+    {
+        AttributeReference k = new AttributeReference("k", DataTypes.IntegerType, true,
+                Metadata.empty(), NamedExpression.newExprId(), getEmptyStringSeq());
+        return new LocalRelation(seq((Attribute) k), getEmptyInternalRowSeq(), false);
+    }
+
+    private static MergeIntoTable merge(LogicalPlan target, LogicalPlan source)
+    {
+        Expression condition = new EqualTo(new UnresolvedAttribute(seq("t", "k")),
+                new UnresolvedAttribute(seq("s", "k")));
+        return new MergeIntoTable(target, source, condition,
+                TestNDBRCLSResolvedRelationAdaptorRule.<MergeAction>seq(
+                        new DeleteAction(Option.empty())),
+                TestNDBRCLSResolvedRelationAdaptorRule.<MergeAction>seq(),
+                TestNDBRCLSResolvedRelationAdaptorRule.<MergeAction>seq());
     }
 
     private static Attribute output(LogicalPlan plan, String name)
@@ -254,5 +282,29 @@ public class TestNDBRCLSResolvedRelationAdaptorRule
                 update(userAlias("t", alias("tgt", columnMask(relation))), relation)))
                 .isInstanceOf(VastRuntimeException.class)
                 .hasMessageContaining(UPDATE_REFUSED);
+    }
+
+    @Test
+    public void testMergeTargetWithRowFilterOrColumnMaskIsRefusedUnderAnyAliases()
+    {
+        DataSourceV2Relation relation = relation("tgt");
+        LocalRelation source = source();
+        for (LogicalPlan secured : new LogicalPlan[] {rowFilter(relation), columnMask(relation)}) {
+            LogicalPlan[] targets = {secured, alias("tgt", secured),
+                    userAlias("t", alias("tgt", secured))};
+            for (LogicalPlan target : targets) {
+                assertThatThrownBy(() -> rule.apply(merge(new NDBMergeTarget(target), source)))
+                        .as("marked target " + target)
+                        .isInstanceOf(VastRuntimeException.class)
+                        .hasMessageContaining(MERGE_REFUSED);
+                assertThatThrownBy(() -> rule.apply(merge(target, source)))
+                        .as("target " + target)
+                        .isInstanceOf(VastRuntimeException.class)
+                        .hasMessageContaining(MERGE_REFUSED);
+            }
+        }
+        MergeIntoTable plain = merge(new NDBMergeTarget(userAlias("t", alias("tgt", relation))),
+                source);
+        assertSame(rule.apply(plain), plain);
     }
 }

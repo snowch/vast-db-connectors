@@ -30,6 +30,7 @@ import com.vastdata.mockserver.VastRootHandler;
 import com.vastdata.mockserver.handle.MockSchemaUtil;
 import com.vastdata.spark.CommonSparkTestUtils;
 import com.vastdata.spark.RowLevelDelete;
+import com.vastdata.spark.RowLevelMerge;
 import com.vastdata.spark.RowLevelUpdate;
 import com.vastdata.spark.SparkTestUtils;
 import com.vastdata.spark.VastArrowAllocator;
@@ -66,6 +67,7 @@ import org.apache.spark.sql.catalyst.plans.logical.AppendData;
 import org.apache.spark.sql.catalyst.plans.logical.ColumnStat;
 import org.apache.spark.sql.catalyst.plans.logical.Filter;
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
+import org.apache.spark.sql.catalyst.plans.logical.MergeRows;
 import org.apache.spark.sql.catalyst.plans.logical.Project;
 import org.apache.spark.sql.catalyst.plans.logical.Statistics;
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias;
@@ -3374,6 +3376,330 @@ public class TestVastCatalog
             analyzeRowLevel(session,
                     "UPDATE " + TARGET_TABLE + " SET v = concat(tgt.v, 'x') WHERE tgt.k = 1",
                     RowLevelUpdate.class);
+        }
+    }
+
+    // ---- MERGE INTO: analysis only, the mock server has no QueryData ----
+
+    private static String upsert(String target)
+    {
+        return "MERGE INTO " + target + " t USING " + SOURCE_TABLE + " s ON t.k = s.k " +
+                "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *";
+    }
+
+    private static VastTable rowLevelVastTable(WriteDelta writeDelta)
+    {
+        RowLevelOperationTable operationTable = (RowLevelOperationTable) ((DataSourceV2Relation) writeDelta.table()).table();
+        return (VastTable) operationTable.table();
+    }
+
+    // row projection: row id first, then the data columns; row id projection: the id only
+    private static void assertMergeRowLayouts(WriteDelta writeDelta)
+    {
+        assertEquals(fieldNames(writeDelta.projections().rowProjection().get().schema()),
+                java.util.List.of(SPARK_INT64_ROW_ID_FIELD.name(), "k", "v"));
+        assertEquals(fieldNames(writeDelta.projections().rowIdProjection().schema()),
+                java.util.List.of(SPARK_INT64_ROW_ID_FIELD.name()));
+        assertTrue(writeDelta.projections().metadataProjection().isEmpty());
+        assertTrue(writeDelta.query() instanceof MergeRows, "query: " + writeDelta.query());
+    }
+
+    private void setMergeTargetSecurity(SparkSession session, String table,
+            RowColumnSecurityResponse rowColumnSecurityResponse)
+            throws VastUserException
+    {
+        connectorResolution(session).setRowColumnsSecurityResponse("buck/schem",
+                table, rowColumnSecurityResponse);
+    }
+
+    @Test
+    public void testMergeUpsertWithStars()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            WriteDelta writeDelta = analyzeRowLevel(session, upsert(TARGET_TABLE),
+                    RowLevelMerge.class);
+            assertMergeRowLayouts(writeDelta);
+            VastTable table = rowLevelVastTable(writeDelta);
+            assertTrue(table.getTableMD().isForMerge());
+            assertFalse(table.getTableMD().isForDelete());
+            assertFalse(table.getTableMD().isForUpdate());
+            MergeRows mergeRows = (MergeRows) writeDelta.query();
+            assertEquals(mergeRows.matchedInstructions().size(), 1);
+            assertEquals(mergeRows.notMatchedInstructions().size(), 1);
+            assertTrue(mergeRows.notMatchedBySourceInstructions().isEmpty());
+            assertTrue(mergeRows.checkCardinality());
+        }
+    }
+
+    @Test
+    public void testMergeExplicitAssignmentsCdcOrderingAndUnaliasedTarget()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            WriteDelta writeDelta = analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " USING " + SOURCE_TABLE + " s ON tgt.k = s.k " +
+                            "WHEN MATCHED AND s.op = 'D' THEN DELETE " +
+                            "WHEN MATCHED THEN UPDATE SET v = concat(tgt.v, s.v) " +
+                            "WHEN NOT MATCHED AND s.op <> 'D' THEN INSERT (k, v) VALUES (s.k, s.v)",
+                    RowLevelMerge.class);
+            assertMergeRowLayouts(writeDelta);
+            MergeRows mergeRows = (MergeRows) writeDelta.query();
+            assertEquals(mergeRows.matchedInstructions().size(), 2);
+            assertEquals(mergeRows.notMatchedInstructions().size(), 1);
+        }
+    }
+
+    // On a real cluster VastCatalog.loadTable treats an empty, non-null masked-columns map as
+    // row/column security, so Spark's own ResolveRelations never resolves a VAST relation:
+    // NDBTablesResolutionRule does, and aliases it with its table name like Spark would.
+    // VastCatalogTestUtils answers such an empty response for every table, which reproduces
+    // that path on the mock server.
+    @Test
+    public void testMergeUnaliasedTargetResolvedByConnector()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            connectorResolution(session);
+            SubqueryAlias alias = connectorAlias(
+                    analyzePlan(session, "SELECT * FROM " + TARGET_TABLE), "tgt");
+            assertTrue(alias.child() instanceof DataSourceV2Relation, "under the alias: " + alias);
+
+            WriteDelta writeDelta = analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " USING " + SOURCE_TABLE + " s ON tgt.k = s.k " +
+                            "WHEN MATCHED THEN UPDATE SET v = s.v",
+                    RowLevelMerge.class);
+            assertMergeRowLayouts(writeDelta);
+
+            session.sql("SELECT * FROM " + SOURCE_TABLE).createOrReplaceTempView("src2");
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " USING src2 ON tgt.k = src2.k " +
+                            "WHEN MATCHED THEN UPDATE SET v = src2.v",
+                    RowLevelMerge.class));
+        }
+    }
+
+    @Test
+    public void testMergeSubqueryAndCteSources()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING (SELECT k, v FROM " + SOURCE_TABLE + " WHERE op <> 'X') s ON t.k = s.k " +
+                            "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+                    RowLevelMerge.class));
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "WITH s AS (SELECT k, v FROM " + SOURCE_TABLE + ") " +
+                            "MERGE INTO " + TARGET_TABLE + " t USING s ON t.k = s.k " +
+                            "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+                    RowLevelMerge.class));
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING (SELECT 1 AS k, 'x' AS v) s ON t.k = s.k " +
+                            "WHEN MATCHED THEN UPDATE SET *",
+                    RowLevelMerge.class));
+        }
+    }
+
+    @Test
+    public void testMergeNotMatchedBySource()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            WriteDelta writeDelta = analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING " + SOURCE_TABLE + " s ON t.k = s.k " +
+                            "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED BY SOURCE THEN DELETE",
+                    RowLevelMerge.class);
+            assertMergeRowLayouts(writeDelta);
+            MergeRows mergeRows = (MergeRows) writeDelta.query();
+            assertEquals(mergeRows.notMatchedBySourceInstructions().size(), 1);
+        }
+    }
+
+    @Test
+    public void testMergeInsertOnlyIsAPlainAppend()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            LogicalPlan analyzed = analyzePlan(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING " + SOURCE_TABLE + " s ON t.k = s.k " +
+                            "WHEN NOT MATCHED THEN INSERT *");
+            assertTrue(analyzed instanceof AppendData, "analyzed plan: " + analyzed);
+            DataSourceV2Relation relation = (DataSourceV2Relation) ((AppendData) analyzed).table();
+            assertTrue(relation.table() instanceof VastTable, "table: " + relation.table());
+            assertFalse(((VastTable) relation.table()).getTableMD().isForMerge());
+            assertEquals(outputNames(relation), java.util.List.of("k", "v"));
+        }
+    }
+
+    @Test
+    public void testMergeAssignmentToRowIdIsRefused()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING " + SOURCE_TABLE + " s ON t.k = s.k " +
+                            "WHEN MATCHED THEN UPDATE SET " + SPARK_INT64_ROW_ID_FIELD.name() + " = 1"))
+                    .isInstanceOf(VastRuntimeException.class)
+                    .hasMessageContaining("Assigning a value to " + SPARK_INT64_ROW_ID_FIELD.name() + " is not allowed");
+            assertThatThrownBy(() -> analyzePlan(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING " + SOURCE_TABLE + " s ON t.k = s.k " +
+                            "WHEN MATCHED THEN DELETE " +
+                            "WHEN NOT MATCHED THEN INSERT (" + SPARK_INT64_ROW_ID_FIELD.name() + ", k, v) VALUES (1, s.k, s.v)"))
+                    .isInstanceOf(VastRuntimeException.class)
+                    .hasMessageContaining("is not allowed");
+        }
+    }
+
+    @Test
+    public void testMergeWithColumnMaskIsRefused()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            setMergeTargetSecurity(session, "tgt_masked", columnMask());
+            assertThatThrownBy(() -> analyzePlan(session, upsert(MASKED_TABLE)))
+                    .isInstanceOf(VastRuntimeException.class)
+                    .hasMessageContaining("Merge into table is not allowed by current VAST security policy rules");
+        }
+    }
+
+    @Test
+    public void testMergeWithRowFilterIsRefused()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            setMergeTargetSecurity(session, "tgt_filtered", rowFilter());
+            assertThatThrownBy(() -> analyzePlan(session, upsert(FILTERED_TABLE)))
+                    .isInstanceOf(VastRuntimeException.class)
+                    .hasMessageContaining("Merge into table is not allowed by current VAST security policy rules");
+        }
+    }
+
+    @Test
+    public void testDeleteAndUpdateStillResolveAsBeforeMerge()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            WriteDelta delete = analyzeRowLevel(session,
+                    "DELETE FROM " + TARGET_TABLE + " WHERE k = 1", RowLevelDelete.class);
+            assertTrue(rowLevelVastTable(delete).getTableMD().isForDelete());
+            assertFalse(rowLevelVastTable(delete).getTableMD().isForMerge());
+            assertEquals(fieldNames(delete.projections().rowIdProjection().schema()),
+                    java.util.List.of(SPARK_INT64_ROW_ID_FIELD.name()));
+            WriteDelta update = analyzeRowLevel(session,
+                    "UPDATE " + TARGET_TABLE + " SET v = 'x' WHERE k = 1", RowLevelUpdate.class);
+            assertTrue(rowLevelVastTable(update).getTableMD().isForUpdate());
+            assertFalse(rowLevelVastTable(update).getTableMD().isForMerge());
+            assertEquals(fieldNames(update.projections().rowProjection().get().schema()),
+                    java.util.List.of(SPARK_INT64_ROW_ID_FIELD.name(), "k", "v"));
+        }
+    }
+
+    // The MERGE cases of the table-name alias tests above: an unaliased VAST source, an unaliased
+    // target, and the insert-only path
+    @Test
+    public void testConnectorResolvedMergeSourceAndTargetByTableName()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            connectorResolution(session);
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING " + SOURCE_TABLE + " ON t.k = src.k " +
+                            "WHEN MATCHED AND src.op = 'D' THEN DELETE " +
+                            "WHEN MATCHED THEN UPDATE SET v = src.v " +
+                            "WHEN NOT MATCHED THEN INSERT (k, v) VALUES (src.k, src.v)",
+                    RowLevelMerge.class));
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " USING " + SOURCE_TABLE + " ON tgt.k = src.k " +
+                            "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+                    RowLevelMerge.class));
+            // an insert-only merge keeps its bare target, the source is aliased
+            LogicalPlan insertOnly = analyzePlan(session,
+                    "MERGE INTO " + TARGET_TABLE + " USING " + SOURCE_TABLE + " ON tgt.k = src.k " +
+                            "WHEN NOT MATCHED THEN INSERT *");
+            assertTrue(insertOnly instanceof AppendData, "analyzed plan: " + insertOnly);
+            AppendData append = (AppendData) insertOnly;
+            assertTrue(append.table() instanceof DataSourceV2Relation, "target: " + append.table());
+            assertTrue(((DataSourceV2Relation) append.table()).table() instanceof VastTable);
+            connectorAlias(append.query(), "src");
+        }
+    }
+
+    // MERGE into a table with a row filter or a column mask is refused whatever the aliases above
+    // the target, like UPDATE
+    @Test
+    public void testConnectorResolvedMergeIntoSecuredTableIsRefusedForAliasedAndUnaliasedTargets()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            VastCatalogTestUtils utils = connectorResolution(session);
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_filtered", rowFilter());
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_masked", columnMask());
+            // {target suffix, qualifier of the filtered table's columns, of the masked table's}
+            String[][] forms = {{"", "tgt_filtered.", "tgt_masked."}, {" AS t", "t.", "t."}};
+            for (String[] form : forms) {
+                assertRefused(session, "MERGE INTO " + FILTERED_TABLE + form[0] + " USING " + SOURCE_TABLE +
+                                " ON " + form[1] + "k = src.k WHEN MATCHED THEN DELETE",
+                        "Merge into table is not allowed by current VAST security policy rules");
+                assertRefused(session, "MERGE INTO " + MASKED_TABLE + form[0] + " USING " + SOURCE_TABLE +
+                                " s ON " + form[2] + "k = s.k WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+                        "Merge into table is not allowed by current VAST security policy rules");
+            }
+        }
+    }
+
+    // A MERGE whose source is a table with a row filter or a column mask sees what a SELECT
+    // sees: the wrappers stay on the source side of the rewritten plan
+    @Test
+    public void testConnectorResolvedMergeSourceOnSecuredTableSeesWhatSelectSees()
+            throws VastUserException
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            VastCatalogTestUtils utils = connectorResolution(session);
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_filtered", rowFilter());
+            utils.setRowColumnsSecurityResponse("buck/schem", "tgt_masked", columnMask());
+            WriteDelta filteredSource = analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING " + FILTERED_TABLE + " ON t.k = tgt_filtered.k " +
+                            "WHEN MATCHED THEN UPDATE SET v = tgt_filtered.v WHEN NOT MATCHED THEN INSERT *",
+                    RowLevelMerge.class);
+            assertTrue(hasRowFilterOver(filteredSource.query(), "tgt_filtered"),
+                    "merge plan: " + filteredSource.query());
+            WriteDelta maskedSource = analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING " + MASKED_TABLE + " ON t.k = tgt_masked.k " +
+                            "WHEN MATCHED THEN UPDATE SET v = tgt_masked.v",
+                    RowLevelMerge.class);
+            assertTrue(hasColumnMaskOver(maskedSource.query(), "tgt_masked"),
+                    "merge plan: " + maskedSource.query());
+            WriteDelta subquerySource = analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING (SELECT * FROM " + FILTERED_TABLE + ") s ON t.k = s.k " +
+                            "WHEN MATCHED THEN DELETE",
+                    RowLevelMerge.class);
+            assertTrue(hasRowFilterOver(subquerySource.query(), "tgt_filtered"),
+                    "merge plan: " + subquerySource.query());
+            LogicalPlan insertOnly = analyzePlan(session,
+                    "MERGE INTO " + TARGET_TABLE + " t USING " + FILTERED_TABLE + " ON t.k = tgt_filtered.k " +
+                            "WHEN NOT MATCHED THEN INSERT *");
+            assertTrue(insertOnly instanceof AppendData, "analyzed plan: " + insertOnly);
+            assertTrue(hasRowFilterOver(((AppendData) insertOnly).query(), "tgt_filtered"),
+                    "append plan: " + insertOnly);
+        }
+    }
+
+    // Spark resolution path (the mock server's default): unaliased target and source by table name
+    @Test
+    public void testSparkResolvedMergeByTableName()
+    {
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            createAliasTestTables(session);
+            assertMergeRowLayouts(analyzeRowLevel(session,
+                    "MERGE INTO " + TARGET_TABLE + " USING " + SOURCE_TABLE + " ON tgt.k = src.k " +
+                            "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+                    RowLevelMerge.class));
         }
     }
 }
