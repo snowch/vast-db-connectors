@@ -99,9 +99,9 @@ New tests (TestNG, no cluster; the mock VAST server has no `QueryData`, so nothi
   `NDBCommon.vastClient` is a static singleton that `clearConfig()` does not reset, so only one mock
   server port works per JVM (same reason the existing DELETE/UPDATE analysis tests are there).
 
-Results so far (JDK 17, flags above), targeted runs of `TestVastCatalog`, `TestVastRowLevelOperationBuilder`,
-`TestNDBParserMergeInto`, `TestNDBRowLevelResolutionRuleMerge`, `TestVastMergeWriter`: `spark35` 114 tests,
-`spark35-scala212` 113 tests, 0 failures. Full-module runs: in progress, numbers to follow in the final commit.
+Results (JDK 17, flags above), full module runs on the final tree: `spark35` 148 tests, 0 failures
+(113 before the change + 35 new); `spark35-scala212` 147 tests, 0 failures (112 + 35; its
+`TestVastCatalog` has one test fewer). `ndb-common` (129) and `spark-common` (6) are unchanged and pass.
 
 ## Not verified
 
@@ -228,6 +228,9 @@ Things a maintainer should know:
   `partitionedCtxs` machinery with an empty key whenever `partitioned_insert` is on (the default).
 * `NDBCommon.vastClient` is a static singleton not reset by `clearConfig()`; tests that need a mock
   server must share `TestVastCatalog`'s.
-* Spark aliases a resolved table with the suffixed lookup identifier, so `DELETE FROM t WHERE t.k = 1`
-  / `UPDATE t SET ... WHERE t.k = 1` (table-qualified references, unaliased target) appear not to
-  resolve today. MERGE cleans the alias for its target; DELETE/UPDATE are left as they are.
+* Spark aliases a resolved table with the suffixed lookup identifier, so table-qualified references
+  to an unaliased DELETE/UPDATE target do not resolve today. Verified against the mock server with a
+  throwaway test (not kept): `DELETE FROM ndb.buck.schem.tgt WHERE tgt.k = 1` and
+  `UPDATE ndb.buck.schem.tgt SET v = 'x' WHERE tgt.k = 1` fail with `UNRESOLVED_COLUMN` (Spark suggests
+  ``tgt VAST_DB_ROW_LEVEL_OP`.`k``), `DELETE FROM ndb.buck.schem.tgt AS t WHERE t.k = 1` works. MERGE
+  restores the plain alias for its target, so `ON tgt.k = s.k` works; DELETE/UPDATE are left as they are.
