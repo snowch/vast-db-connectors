@@ -118,16 +118,34 @@ Results (JDK 17, flags above), full module runs on the final tree: `spark35` 151
 ## Cluster verification
 
 The connector's unit tests cannot execute a write (the mock VAST server has no `QueryData`), so
-end-to-end behaviour was verified by the author's test run against a real VAST cluster (Spark 3.5.1),
-not by anything in this repository's test suite. Reported results, for a plain table and for a table
-with sorted columns (DEC128 row ids):
+end-to-end behaviour was verified by the author's test run against a real VAST cluster, not by
+anything in this repository's test suite. What ran: the **`spark35` (Scala 2.13) build only**, on
+Spark 3.5.1 `local[2]`, JDK 11; the `spark35-scala212` build has not been run on a cluster.
+Reported results, for a plain table and for a table with sorted columns (DEC128 row ids):
 
-* all 25 scenarios below pass on both tables, plus the string-key and partitioned-table checks
-  (8 more);
-* two 300k-row merges, one per table: 420,000 rows after the merge, 120,000 updated, 150,000
-  inserted, no deleted row left;
+* the author's script runs 25 checks per table, covering the statements below except where a
+  statement says otherwise; all pass on both tables, plus the string-key and partitioned-table
+  checks (8 more);
+* two 300k-row merges, one per table: 300k target rows and 300k source rows in 8 source
+  partitions, `spark.ndb.max_row_count_per_update` and `_delete` set to 5000 and the *default*
+  `max_row_count_per_insert` (a low insert chunk size triggers the pre-existing INSERT bug under
+  "Observed, not changed", so it was deliberately not used): 420,000 rows after the merge,
+  120,000 updated, 150,000 inserted, no deleted row left;
+* failure injected mid-write: a 50k-row MERGE whose source has one row for which
+  `CAST(s.v AS INT)` fails under ANSI mode; the table was unchanged afterwards (row count and a
+  column sum checked);
+* the same merge inside an explicit transaction, committed, and rolled back;
 * the only failures are the two unaliased-source cases noted under "Observed, not changed", which
   fail the same way without this PR.
+
+Not verified on a cluster:
+
+* the row/column-security case at the end of the list (a MERGE into a table with a row filter or
+  a column mask must be refused; a MERGE whose *source* is such a table must see only what a
+  SELECT sees): the test cluster had no security policies. The mock-server tests
+  `testMergeWithColumnMaskIsRefused` / `testMergeWithRowFilterIsRefused` cover the refusal at
+  analysis only;
+* the `spark35-scala212` build.
 
 The scenarios, so a maintainer can repeat them:
 
@@ -189,21 +207,22 @@ ON t.k = s.k WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;
 MERGE INTO ndb.b.s.tgt t USING (SELECT * FROM ndb.b.s.src WHERE 1 = 0) s ON t.k = s.k
 WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;   -- no-op
 
--- several chunks per context and several tasks: e.g. 1M source rows with
---   spark.ndb.max_row_count_per_insert / _update / _delete set low, and a source with many partitions
+-- several chunks per context and several tasks (as run: 300k target rows, 300k source rows in
+--   8 partitions, spark.ndb.max_row_count_per_update / _delete = 5000, the default _insert)
 
--- failure injected mid-write leaves the table unchanged
---   (e.g. a source expression that throws for one row: CAST('x' AS INT) under ANSI, or a killed executor)
+-- failure injected mid-write leaves the table unchanged (as run: a 50k-row MERGE whose source
+--   has one row for which CAST(s.v AS INT) fails under ANSI mode; count and sum unchanged after)
 
--- the same merge inside an explicit transaction, rolled back, leaves no trace
+-- the same merge inside an explicit transaction: committed, and rolled back (no trace)
 SELECT ndb.create_tx();
 MERGE INTO ndb.b.s.tgt t USING ndb.b.s.src s ON t.k = s.k WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;
-SELECT ndb.rollback_tx();
+SELECT ndb.commit_tx();   -- and the same run with SELECT ndb.rollback_tx();
 
 -- plain DELETE and UPDATE still behave as before
 DELETE FROM ndb.b.s.tgt WHERE k = 1;
 UPDATE ndb.b.s.tgt SET n = n + 1 WHERE k = 2;
 
+-- NOT RUN (no security policies on the test cluster), see "Not verified on a cluster" above:
 -- a user restricted by row/column security: MERGE into a table with a row filter or column mask
 -- must fail with "Merge into table is not allowed by current VAST security policy rules",
 -- and a MERGE whose *source* is such a table must see only what a SELECT sees.
