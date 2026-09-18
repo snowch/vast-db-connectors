@@ -1,6 +1,6 @@
 # Spark 3.5: alias the VAST relations the connector resolves with their table name
 
-Branch `claude/connector-table-qualifiers`, stacked on the MERGE INTO branch (`claude/zealous-davinci-6ptnat`).
+Branch `claude/connector-table-qualifiers`, stacked on the MERGE INTO branch (`claude/spark35-merge-into`).
 Both trees, `spark35` and `spark35-scala212`.
 
 ## What and why
