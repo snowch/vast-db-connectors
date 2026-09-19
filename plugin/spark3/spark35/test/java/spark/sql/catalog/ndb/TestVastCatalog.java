@@ -9,6 +9,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.sun.net.httpserver.HttpExchange;
+import com.vastdata.TableLayout;
 import com.vastdata.client.RowColumnSecurityResponse;
 import com.vastdata.client.VastClient;
 import com.vastdata.client.VastConfig;
@@ -17,6 +18,7 @@ import com.vastdata.client.error.VastConflictException;
 import com.vastdata.client.error.VastException;
 import com.vastdata.client.error.VastRuntimeException;
 import com.vastdata.client.error.VastUserException;
+import com.vastdata.client.partition.PartitionColumnMetadata;
 import com.vastdata.client.partition.PartitionConstants;
 import com.vastdata.client.stats.VastStatistics;
 import com.vastdata.client.tx.SimpleVastTransaction;
@@ -34,6 +36,7 @@ import com.vastdata.spark.RowLevelMerge;
 import com.vastdata.spark.RowLevelUpdate;
 import com.vastdata.spark.SparkTestUtils;
 import com.vastdata.spark.VastArrowAllocator;
+import com.vastdata.spark.VastPartitionedTable;
 import com.vastdata.spark.VastScan;
 import com.vastdata.spark.VastTable;
 import com.vastdata.spark.VastView;
@@ -43,8 +46,11 @@ import com.vastdata.spark.statistics.SparkVastStatisticsManager;
 import com.vastdata.spark.statistics.SparkVastStatisticsManagerTestUtil;
 import com.vastdata.spark.statistics.TableLevelStatistics;
 import com.vastdata.spark.tx.VastSparkTransactionsManager;
+import com.vastdata.spark.write.VastPartitionedWriteBuilder;
+import com.vastdata.spark.write.VastWriteBuilder;
 import ndb.NDB;
 import ndb.NDBJobsListener;
+import ndb.NDBTestClients;
 import org.apache.spark.SparkConf;
 import org.apache.spark.SparkException;
 import org.apache.spark.scheduler.SparkListenerInterface;
@@ -62,6 +68,7 @@ import org.apache.spark.sql.catalyst.expressions.AttributeMap$;
 import org.apache.spark.sql.catalyst.expressions.AttributeReference;
 import org.apache.spark.sql.catalyst.expressions.AttributeSet;
 import org.apache.spark.sql.catalyst.expressions.ExprId;
+import org.apache.spark.sql.catalyst.expressions.Expression;
 import org.apache.spark.sql.catalyst.parser.ParseException;
 import org.apache.spark.sql.catalyst.plans.logical.AppendData;
 import org.apache.spark.sql.catalyst.plans.logical.ColumnStat;
@@ -69,6 +76,7 @@ import org.apache.spark.sql.catalyst.plans.logical.Filter;
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
 import org.apache.spark.sql.catalyst.plans.logical.MergeRows;
 import org.apache.spark.sql.catalyst.plans.logical.Project;
+import org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression;
 import org.apache.spark.sql.catalyst.plans.logical.Statistics;
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias;
 import org.apache.spark.sql.catalyst.plans.logical.WriteDelta;
@@ -83,6 +91,7 @@ import org.apache.spark.sql.connector.write.RowLevelOperationTable;
 import org.apache.spark.sql.execution.CommandExecutionMode$;
 import org.apache.spark.sql.execution.FilterExec;
 import org.apache.spark.sql.execution.ProjectExec;
+import org.apache.spark.sql.execution.QueryExecution;
 import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec;
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec;
@@ -151,10 +160,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.AssertionsForClassTypes.catchThrowableOfType;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 import static org.mockito.MockitoAnnotations.openMocks;
 import static org.testng.Assert.assertEquals;
@@ -164,6 +177,7 @@ import static org.testng.Assert.expectThrows;
 import static org.testng.Assert.fail;
 import static spark.sql.catalog.ndb.SparkConfValidator.FORMAT_UNSAFE_SPARK_CONFIGURATION;
 import static spark.sql.catalog.ndb.SparkConfValidator.SETTING_DISABLE_SPARK_DUPLICATE_WRITES_PROTECTION;
+import static spark.sql.catalog.ndb.TypeUtil.SPARK_DEC128_ROW_ID_FIELD;
 import static spark.sql.catalog.ndb.TypeUtil.SPARK_INT64_ROW_ID_FIELD;
 
 @Listeners(CommonSparkTestUtils.TestListener.class)
@@ -2997,6 +3011,7 @@ public class TestVastCatalog
     // UPDATE is unchanged.
 
     private static final String TARGET_TABLE = "ndb.buck.schem.tgt";
+    private static final String PARTITIONED_TABLE = "ndb.buck.schem.ptgt";
     private static final String SOURCE_TABLE = "ndb.buck.schem.src";
     private static final String FILTERED_TABLE = TARGET_TABLE + "_filtered";
     private static final String MASKED_TABLE = TARGET_TABLE + "_masked";
@@ -3015,7 +3030,7 @@ public class TestVastCatalog
         return java.util.List.of(schema.fieldNames());
     }
 
-    private static LogicalPlan analyzePlan(SparkSession session, String sql)
+    private static QueryExecution queryExecution(SparkSession session, String sql)
     {
         LogicalPlan parsed;
         try {
@@ -3026,8 +3041,18 @@ public class TestVastCatalog
         }
         return session
                 .sessionState()
-                .executePlan(parsed, CommandExecutionMode$.MODULE$.SKIP())
-                .analyzed();
+                .executePlan(parsed, CommandExecutionMode$.MODULE$.SKIP());
+    }
+
+    private static LogicalPlan analyzePlan(SparkSession session, String sql)
+    {
+        return queryExecution(session, sql).analyzed();
+    }
+
+    // the optimizer builds the write (V2Writes), nothing executes
+    private static LogicalPlan optimizePlan(SparkSession session, String sql)
+    {
+        return queryExecution(session, sql).optimizedPlan();
     }
 
     private static WriteDelta analyzeRowLevel(SparkSession session, String sql,
@@ -3724,6 +3749,82 @@ public class TestVastCatalog
                     "MERGE INTO " + TARGET_TABLE + " USING " + SOURCE_TABLE + " ON tgt.k = src.k " +
                             "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
                     RowLevelMerge.class));
+        }
+    }
+
+    // The mock server keeps no partition spec, so the layout the catalog fetches for this one
+    // table is completed with an identity partition on the column; the table's "partitions"
+    // table exists on the mock (CREATE TABLE ... PARTITIONED BY creates it, with a placeholder
+    // column), everything else is answered by the real client
+    private static VastClient partitionedLayoutFor(VastClient client, String table,
+            String column)
+            throws VastException
+    {
+        VastClient spied = spy(client);
+        doAnswer(invocation -> {
+            TableLayout layout = (TableLayout) invocation.callRealMethod();
+            return new TableLayout(layout.getSchema(), layout.getSortedColumns(),
+                    java.util.List.of(new PartitionColumnMetadata(column, "int", column, "int",
+                            "Identity", null)));
+        }).when(spied).fetchTableLayout(any(), anyString(), eq(table), anyInt(), any(),
+                nullable(String.class));
+        return spied;
+    }
+
+    // MERGE into a partitioned table: the delta write is the partitioned write builder, so Spark
+    // clusters the delta by the partition key before the writer chunks the inserted rows per
+    // partition, as for INSERT; DELETE and UPDATE keep the plain builder
+    @Test
+    public void testMergeIntoPartitionedTableClustersTheDeltaByPartitionKey()
+            throws Exception
+    {
+        VastClient client = NDBTestClients.current();
+        try (SparkSession session = SparkTestUtils.getSession(testPort)) {
+            // installed before the session's catalog initializes
+            NDBTestClients.set(partitionedLayoutFor(NDB.getVastClient(NDB.getConfig()), "ptgt",
+                    "k"));
+            createAliasTestTables(session);
+            session.sql("CREATE TABLE " + PARTITIONED_TABLE + " (k int, v string) PARTITIONED BY (k)").show();
+            WriteDelta analyzed = analyzeRowLevel(session, upsert(PARTITIONED_TABLE),
+                    RowLevelMerge.class);
+            VastTable table = rowLevelVastTable(analyzed);
+            assertTrue(table instanceof VastPartitionedTable, "table: " + table);
+            assertEquals(table.partitioning().length, 1, "partitioning: " + table);
+            assertTrue(table.getTableMD().isForMerge());
+            // a partitioned table carries the wide row id
+            assertEquals(fieldNames(analyzed.projections().rowProjection().get().schema()),
+                    java.util.List.of(SPARK_DEC128_ROW_ID_FIELD.name(), "k", "v"));
+            assertEquals(fieldNames(analyzed.projections().rowIdProjection().schema()),
+                    java.util.List.of(SPARK_DEC128_ROW_ID_FIELD.name()));
+
+            LogicalPlan optimized = optimizePlan(session, upsert(PARTITIONED_TABLE));
+            assertTrue(optimized instanceof WriteDelta, "optimized plan: " + optimized);
+            WriteDelta writeDelta = (WriteDelta) optimized;
+            assertTrue(writeDelta.write().get() instanceof VastPartitionedWriteBuilder,
+                    "write: " + writeDelta.write());
+            assertTrue(writeDelta.query() instanceof RepartitionByExpression,
+                    "query: " + writeDelta.query());
+            RepartitionByExpression repartition = (RepartitionByExpression) writeDelta.query();
+            assertEquals(repartition.partitionExpressions().size(), 1,
+                    "partition expressions: " + repartition.partitionExpressions());
+            Expression key = repartition.partitionExpressions().apply(0);
+            assertTrue(key instanceof Attribute && ((Attribute) key).name().equals("k"),
+                    "partition key: " + key);
+            assertTrue(repartition.child() instanceof MergeRows, "child: " + repartition.child());
+
+            for (String statement : new String[] {
+                    "DELETE FROM " + PARTITIONED_TABLE + " WHERE k = 1",
+                    "UPDATE " + PARTITIONED_TABLE + " SET v = 'x' WHERE k = 1"}) {
+                LogicalPlan plain = optimizePlan(session, statement);
+                assertTrue(plain instanceof WriteDelta, statement + ": " + plain);
+                assertEquals(((WriteDelta) plain).write().get().getClass(), VastWriteBuilder.class,
+                        statement);
+                assertFalse(((WriteDelta) plain).query() instanceof RepartitionByExpression,
+                        statement + ": " + ((WriteDelta) plain).query());
+            }
+        }
+        finally {
+            NDBTestClients.set(client);
         }
     }
 }

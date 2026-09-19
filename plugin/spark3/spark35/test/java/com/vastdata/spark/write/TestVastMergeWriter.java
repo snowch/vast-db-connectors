@@ -25,6 +25,7 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.InternalRow$;
+import org.apache.spark.sql.connector.expressions.Expressions;
 import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.connector.write.DeltaWriter;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
@@ -39,6 +40,7 @@ import org.testng.annotations.Test;
 import scala.collection.immutable.List$;
 import scala.collection.immutable.Map$;
 import scala.collection.mutable.Builder;
+import spark.sql.catalog.ndb.BoundBucketFunction;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -72,7 +74,9 @@ import static spark.sql.catalog.ndb.TypeUtil.SPARK_INT64_ROW_ID_FIELD;
 
 /**
  * Drives a VastWriteFactory in MERGE mode with a mocked VastClient and checks
- * which RPC every kind of row ends up in, with which Arrow schema.
+ * which RPC every kind of row ends up in, with which Arrow schema; the chunk
+ * hand-off to the background writer, which MERGE shares with plain INSERT, is
+ * checked in both modes.
  */
 @Listeners(CommonSparkTestUtils.TestListener.class)
 public class TestVastMergeWriter
@@ -91,9 +95,11 @@ public class TestVastMergeWriter
         final List<ArrowType> types;
         final int rows;
         final List<Object> firstColumn;
+        // the values of the partition key column k, empty when the request does not carry it
+        final List<Object> keys;
 
         Rpc(String kind, String path, org.apache.arrow.vector.types.pojo.Schema schema,
-                int rows, List<Object> firstColumn)
+                int rows, List<Object> firstColumn, List<Object> keys)
         {
             this.kind = kind;
             this.path = path;
@@ -103,12 +109,13 @@ public class TestVastMergeWriter
                     Collectors.toList());
             this.rows = rows;
             this.firstColumn = firstColumn;
+            this.keys = keys;
         }
 
         @Override
         public String toString()
         {
-            return kind + path + fields + types + "x" + rows + firstColumn;
+            return kind + path + fields + types + "x" + rows + firstColumn + " k=" + keys;
         }
     }
 
@@ -130,6 +137,19 @@ public class TestVastMergeWriter
             }
             else {
                 values.add(vector.getObject(i));
+            }
+        }
+        return values;
+    }
+
+    private static List<Object> keyValues(VectorSchemaRoot root)
+    {
+        List<Object> values = new ArrayList<>();
+        for (FieldVector vector : root.getFieldVectors()) {
+            if (vector.getName().equals("k")) {
+                for (int i = 0; i < root.getRowCount(); i++) {
+                    values.add(vector.getObject(i));
+                }
             }
         }
         return values;
@@ -188,7 +208,8 @@ public class TestVastMergeWriter
             VectorSchemaRoot root = invocation.getArgument(3);
             rpcs.add(new Rpc("delete",
                     "/" + invocation.getArgument(1) + "/" + invocation.getArgument(2),
-                    root.getSchema(), root.getRowCount(), firstColumnValues(root)));
+                    root.getSchema(), root.getRowCount(), firstColumnValues(root),
+                    keyValues(root)));
             return null;
         }).when(client).deleteRows(any(), anyString(), anyString(),
                 any(VectorSchemaRoot.class), any(URI.class), any(),
@@ -197,7 +218,8 @@ public class TestVastMergeWriter
             VectorSchemaRoot root = invocation.getArgument(3);
             rpcs.add(new Rpc("update",
                     "/" + invocation.getArgument(1) + "/" + invocation.getArgument(2),
-                    root.getSchema(), root.getRowCount(), firstColumnValues(root)));
+                    root.getSchema(), root.getRowCount(), firstColumnValues(root),
+                    keyValues(root)));
             return null;
         }).when(client).updateRows(any(), anyString(), anyString(),
                 any(VectorSchemaRoot.class), any(URI.class), any(),
@@ -222,6 +244,21 @@ public class TestVastMergeWriter
         }).when(client).rollbackTransaction(any(), nullable(String.class));
     }
 
+    // a slow client keeps every chunk after the first one in flight, unserialized, while the
+    // foreground commits
+    private void slowInserts(long millis, RowIDStrategyType rowIdType)
+            throws Exception
+    {
+        doAnswer(invocation -> {
+            Thread.sleep(millis);
+            byte[] body = invocation.getArgument(3);
+            int rows = recordIpc("insert", invocation.getArgument(2), body);
+            return rowIds(rows, invocation.getArgument(7), rowIdType);
+        }).when(client).insertRows(any(), any(URI.class), anyString(),
+                any(byte[].class), anyBoolean(), any(QueryDataExtraParams.class),
+                nullable(String.class), any(BufferAllocator.class));
+    }
+
     private int recordIpc(String kind, String path, byte[] body)
             throws IOException
     {
@@ -230,29 +267,57 @@ public class TestVastMergeWriter
                         new ByteArrayInputStream(body), allocator)) {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
             int rows = 0;
+            List<Object> keys = new ArrayList<>();
             while (reader.loadNextBatch()) {
                 rows += root.getRowCount();
+                keys.addAll(keyValues(root));
             }
-            rpcs.add(new Rpc(kind, path, root.getSchema(), rows, List.of()));
+            rpcs.add(new Rpc(kind, path, root.getSchema(), rows, List.of(), keys));
             return rows;
         }
     }
 
     private VastWriteFactory mergeFactory(boolean sorted)
     {
-        StructField rowIdField = sorted ?
-                SPARK_DEC128_ROW_ID_FIELD :
-                SPARK_INT64_ROW_ID_FIELD;
-        StructType schema = new StructType(new StructField[] {rowIdField,
+        return factory(mergeSchema(sorted ? SPARK_DEC128_ROW_ID_FIELD : SPARK_INT64_ROW_ID_FIELD),
+                new Transform[0],
+                sorted ? ImmutableMap.of(SORTED_BY_PROPERTY, "k") : Map.of(), true);
+    }
+
+    // a partitioned table carries the wide row id, like a sorted one
+    private VastWriteFactory partitionedMergeFactory(Transform partitioning)
+    {
+        return factory(mergeSchema(SPARK_DEC128_ROW_ID_FIELD), new Transform[] {partitioning},
+                Map.of(), true);
+    }
+
+    // a plain INSERT writer: no row id in the rows and, as for every table the catalog builds,
+    // an empty (not null) partitioning, so the rows still go through the partition queues
+    private VastWriteFactory insertFactory()
+    {
+        StructType schema = new StructType(new StructField[] {
                 createStructField("k", DataTypes.IntegerType, true),
                 createStructField("v", DataTypes.StringType, true)});
-        Map<String, String> properties = sorted ?
-                ImmutableMap.of(SORTED_BY_PROPERTY, "k") :
-                Map.of();
+        return factory(schema, new Transform[0], Map.of(), false);
+    }
+
+    // MERGE reads the row id with the row: field 0 of the table schema
+    private static StructType mergeSchema(StructField rowIdField)
+    {
+        return new StructType(new StructField[] {rowIdField,
+                createStructField("k", DataTypes.IntegerType, true),
+                createStructField("v", DataTypes.StringType, true)});
+    }
+
+    private VastWriteFactory factory(StructType schema, Transform[] partitioning,
+            Map<String, String> properties, boolean merge)
+    {
         VastTable table = new VastTable(null, SCHEMA_NAME, TABLE_NAME, "handle",
-                schema, new Transform[0], () -> client, false,
+                schema, partitioning, () -> client, false,
                 Optional.empty(), properties);
-        table.getTableMD().setForMerge();
+        if (merge) {
+            table.getTableMD().setForMerge();
+        }
         VastConfig config = getTestConfig()
                 .setMaxRowsPerDelete(CHUNK_SIZE)
                 .setMaxRowsPerUpdate(CHUNK_SIZE)
@@ -277,6 +342,28 @@ public class TestVastMergeWriter
     private static int totalRows(List<Rpc> rpcs)
     {
         return rpcs.stream().mapToInt(r -> r.rows).sum();
+    }
+
+    // the partition keys of every inserted chunk, as the by-column inserter sent them (in the
+    // insert request or in its follow-up update); each chunk and the list of chunks are sorted,
+    // the order the background writer takes is not part of the contract
+    private List<String> insertedKeyChunks()
+    {
+        return chunks(rpcs
+                .stream()
+                .filter(r -> (r.kind.equals("insert") || r.kind.equals("insert-update")) && !r.keys.isEmpty())
+                .map(r -> r.keys)
+                .collect(Collectors.toList()));
+    }
+
+    private static List<String> chunks(List<? extends List<?>> keyChunks)
+    {
+        return keyChunks
+                .stream()
+                .map(chunk -> chunk.stream().map(String::valueOf).sorted().collect(
+                        Collectors.joining(",", "[", "]")))
+                .sorted()
+                .collect(Collectors.toList());
     }
 
     private void assertInterleavedMerge(boolean sorted, ArrowType rowIdType)
@@ -447,5 +534,121 @@ public class TestVastMergeWriter
         }
         // every context and every close() funnel into the one shared rollback
         assertEquals(rollbacks.get(), 1);
+    }
+
+    // The insert context of a MERGE into a partitioned table chunks its rows per partition key,
+    // computed over the data columns it receives (the row id slot is dropped first): k is column 0
+    // of an inserted row here but column 1 of the table
+    @Test
+    public void testInsertsIntoPartitionedTableAreChunkedByPartitionKey()
+            throws Exception
+    {
+        stubClient(RowIDStrategyType.DECIMAL_128);
+        DeltaWriter<InternalRow> writer = partitionedMergeFactory(
+                Expressions.identity("k")).createWriter(0, 7L);
+        writer.insert(row(null, 1, UTF8String.fromString("a")));
+        writer.insert(row(null, 2, UTF8String.fromString("b")));
+        writer.update(null, row(Decimal.apply(3L)), row(Decimal.apply(3L), 2, UTF8String.fromString("c")));
+        writer.insert(row(null, 1, UTF8String.fromString("d")));
+        writer.insert(row(null, 2, UTF8String.fromString("e")));
+        writer.delete(null, row(Decimal.apply(4L)));
+        writer.insert(row(null, 1, UTF8String.fromString("f")));
+        writer.commit();
+        writer.close();
+        assertEquals(rollbacks.get(), 0);
+
+        // k=1 fills a chunk with the first and the third inserted row, k=2 with the second and
+        // the fourth; the last k=1 row is flushed at commit
+        assertEquals(insertedKeyChunks(),
+                chunks(List.of(List.of(1, 1), List.of(2, 2), List.of(1))), "rpcs: " + rpcs);
+        List<Rpc> inserts = rpcs("insert");
+        assertEquals(totalRows(inserts), 5, "inserts: " + inserts);
+        for (Rpc insert : inserts) {
+            assertEquals(insert.path, TABLE_PATH);
+            assertTrue(DATA_COLUMNS.containsAll(insert.fields), "insert: " + insert);
+        }
+        // updates and deletes are keyed by the row id and not grouped
+        assertEquals(rpcs("update").size(), 1, "updates: " + rpcs("update"));
+        assertEquals(rpcs("update").get(0).firstColumn, List.of(3L));
+        assertEquals(rpcs("delete").size(), 1, "deletes: " + rpcs("delete"));
+        assertEquals(rpcs("delete").get(0).firstColumn, List.of(4L));
+    }
+
+    // With a transform the rows are chunked by the transformed key: two keys of one bucket share
+    // a chunk, a key of another bucket does not
+    @Test
+    public void testInsertsIntoBucketPartitionedTableAreChunkedByBucket()
+            throws Exception
+    {
+        int buckets = 4;
+        BoundBucketFunction.BucketInt bucket = new BoundBucketFunction.BucketInt(buckets,
+                DataTypes.IntegerType);
+        int a = 1;
+        int b = 2;
+        while (!bucket.produceResult(row(b)).equals(bucket.produceResult(row(a)))) {
+            b++;
+        }
+        int c = 2;
+        while (bucket.produceResult(row(c)).equals(bucket.produceResult(row(a)))) {
+            c++;
+        }
+        stubClient(RowIDStrategyType.DECIMAL_128);
+        DeltaWriter<InternalRow> writer = partitionedMergeFactory(
+                Expressions.bucket(buckets, "k")).createWriter(0, 7L);
+        writer.insert(row(null, a, UTF8String.fromString("a")));
+        writer.insert(row(null, c, UTF8String.fromString("c")));
+        writer.insert(row(null, b, UTF8String.fromString("b")));
+        writer.insert(row(null, c, UTF8String.fromString("c")));
+        writer.commit();
+        writer.close();
+        assertEquals(rollbacks.get(), 0);
+        assertEquals(insertedKeyChunks(), chunks(List.of(List.of(a, b), List.of(c, c))),
+                "a=" + a + " b=" + b + " c=" + c + " rpcs: " + rpcs);
+        assertEquals(totalRows(rpcs("insert")), 4, "inserts: " + rpcs("insert"));
+    }
+
+    // A full chunk still in flight at commit belongs to the background writer. flushQueues()
+    // used to close the Arrow root of every partition context it stole from, including a root
+    // already handed over, and the chunk was then serialized from freed buffers as NULL rows
+    @Test
+    public void testChunkInFlightAtCommitIsNotClosedUnderTheBackgroundWriter()
+            throws Exception
+    {
+        stubClient(RowIDStrategyType.DECIMAL_128);
+        slowInserts(300, RowIDStrategyType.DECIMAL_128);
+        DeltaWriter<InternalRow> writer = partitionedMergeFactory(
+                Expressions.identity("k")).createWriter(0, 7L);
+        // two full chunks and no remainder, committed right away: the second chunk is
+        // serialized only after commit() ran
+        writer.insert(row(null, 1, UTF8String.fromString("a")));
+        writer.insert(row(null, 1, UTF8String.fromString("b")));
+        writer.insert(row(null, 2, UTF8String.fromString("c")));
+        writer.insert(row(null, 2, UTF8String.fromString("d")));
+        writer.commit();
+        writer.close();
+        assertEquals(rollbacks.get(), 0);
+        assertEquals(insertedKeyChunks(), chunks(List.of(List.of(1, 1), List.of(2, 2))),
+                "rpcs: " + rpcs);
+        assertEquals(totalRows(rpcs("insert")), 4, "inserts: " + rpcs("insert"));
+    }
+
+    // The same hand-off serves a plain INSERT, whose rows all share one partition context
+    @Test
+    public void testPlainInsertChunkInFlightAtCommitIsNotClosedUnderTheBackgroundWriter()
+            throws Exception
+    {
+        stubClient(RowIDStrategyType.UNSIGNED_INT64);
+        slowInserts(300, RowIDStrategyType.UNSIGNED_INT64);
+        DeltaWriter<InternalRow> writer = insertFactory().createWriter(0, 7L);
+        writer.write(row(1, UTF8String.fromString("a")));
+        writer.write(row(1, UTF8String.fromString("b")));
+        writer.write(row(2, UTF8String.fromString("c")));
+        writer.write(row(2, UTF8String.fromString("d")));
+        writer.commit();
+        writer.close();
+        assertEquals(rollbacks.get(), 0);
+        assertEquals(insertedKeyChunks(), chunks(List.of(List.of(1, 1), List.of(2, 2))),
+                "rpcs: " + rpcs);
+        assertEquals(totalRows(rpcs("insert")), 4, "inserts: " + rpcs("insert"));
     }
 }

@@ -6,11 +6,9 @@ package ndb;
 
 import com.vastdata.client.error.ErrorType;
 import com.vastdata.client.error.VastRuntimeException;
-import com.vastdata.spark.VastTable;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.AliasIdentifier;
 import org.apache.spark.sql.catalyst.analysis.AssignmentUtils;
-import org.apache.spark.sql.catalyst.analysis.EliminateSubqueryAliases;
 import org.apache.spark.sql.catalyst.analysis.FieldName;
 import org.apache.spark.sql.catalyst.analysis.ResolvedFieldName;
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute;
@@ -247,17 +245,6 @@ public class NDBRowLevelResolutionRule
                 dataColumns.add(attr);
             }
         });
-        if (!merge.notMatchedActions().isEmpty()) {
-            LogicalPlan relation = EliminateSubqueryAliases.apply(target);
-            if (relation instanceof DataSourceV2Relation && ((DataSourceV2Relation) relation).table() instanceof VastTable) {
-                VastTable vastTable = (VastTable) ((DataSourceV2Relation) relation).table();
-                if (vastTable.partitioning() != null && vastTable.partitioning().length > 0) {
-                    throw new VastRuntimeException(
-                            format("MERGE INTO with a WHEN NOT MATCHED ... INSERT action is not supported on partitioned table %s",
-                                    vastTable.name()), null, ErrorType.USER);
-                }
-            }
-        }
         LogicalPlan source = merge.sourceTable();
         Seq<MergeAction> matchedActions = adaptMergeActions(
                 merge.matchedActions(), dataColumns, rowIdColumns, source);

@@ -343,18 +343,13 @@ public class TestNDBRowLevelResolutionRuleMerge
                 .hasMessageContaining("is not allowed");
     }
 
+    // A partitioned table takes inserts like any other: its delta is clustered by the partition
+    // keys before the write (VastPartitionedWriteBuilder) and the writer chunks the inserted rows
+    // per partition
     @Test
-    public void testInsertIntoPartitionedTableIsRefused()
+    public void testInsertIntoPartitionedTableIsAllowed()
     {
-        SubqueryAlias target = resolvedTarget(partitionedTable());
-        LocalRelation source = source(attr("k", DataTypes.IntegerType),
-                attr("v", DataTypes.StringType));
-        assertThatThrownBy(() -> rule.apply(
-                merge(new NDBMergeTarget(target), source,
-                        seq(new UpdateStarAction(Option.empty())),
-                        seq(new InsertStarAction(Option.empty())), seq())))
-                .isInstanceOf(VastRuntimeException.class)
-                .hasMessageContaining("not supported on partitioned table");
+        assertStarExpansion(partitionedTable(), SPARK_DEC128_ROW_ID_FIELD.name());
     }
 
     @Test

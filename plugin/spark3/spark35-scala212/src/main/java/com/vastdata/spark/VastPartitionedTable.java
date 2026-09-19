@@ -248,10 +248,12 @@ public class VastPartitionedTable
                     tableMD.tableName, info.queryId(), info.schema(),
                     info.options().asCaseSensitiveMap());
 
-            if (tableMD.isForDelete() || tableMD.isForUpdate() || tableMD.isForMerge() || tableMD.forImportData) {
+            if (tableMD.isForDelete() || tableMD.isForUpdate() || tableMD.forImportData) {
                 return new VastWriteBuilder(clientSupplier.get(), this);
             }
 
+            // plain inserts, and MERGE whose delta may carry inserted rows: Spark
+            // clusters the rows by the partition keys before they reach the writer
             return new VastPartitionedWriteBuilder(clientSupplier.get(), this);
         }
         else {

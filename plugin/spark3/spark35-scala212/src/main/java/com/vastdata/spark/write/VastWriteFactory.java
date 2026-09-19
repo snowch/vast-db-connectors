@@ -114,7 +114,7 @@ public class VastWriteFactory
     private final Map<String, String> sessionConfig;
     private final boolean complexRowID;
     private final Set<String> nonUpdatableColumns;
-    private final List<Integer> partitionIndices;
+    private final List<String> partitionColumns;
     private final List<String> transformNames;
     private final List<Integer> transformArgs;
     // set only by the package private constructor (tests); executors always use
@@ -139,11 +139,9 @@ public class VastWriteFactory
         this.sessionConfig = sessionConfig;
         this.complexRowID = rowIDPredicate.test(vastTable);
         if (vastTable.partitioning() != null && !vastTableMetaData.isForDelete() && !vastTableMetaData.isForUpdate() && !vastTableMetaData.forImportData) {
-            this.partitionIndices = Arrays
+            this.partitionColumns = Arrays
                     .stream(vastTable.partitioning())
-                    .map(t -> Arrays
-                            .asList(vastTableMetaData.schema.names())
-                            .indexOf(t.references()[0].fieldNames()[0]))
+                    .map(t -> t.references()[0].fieldNames()[0])
                     .collect(Collectors.toList());
             this.transformNames = Arrays.stream(vastTable.partitioning()).map(
                     Transform::name).collect(Collectors.toList());
@@ -155,7 +153,7 @@ public class VastWriteFactory
                     .collect(Collectors.toList());
         }
         else {
-            this.partitionIndices = null;
+            this.partitionColumns = null;
             this.transformNames = null;
             this.transformArgs = null;
         }
@@ -346,8 +344,10 @@ public class VastWriteFactory
                         dataWriteTraceToken, chunkSize, writeSchema);
                 this.tableArrowSchema = new Schema(
                         TypeUtil.sparkSchemaToArrowFieldsList(writeSchema));
-                if (partitionIndices != null && vastConfig.getPartitionedInsert()) {
-                    List<Expression> projRefs = getTransformExpressions();
+                if (partitionColumns != null && vastConfig.getPartitionedInsert()) {
+                    // the partition key is computed from the rows this context
+                    // receives: for MERGE these are the data columns only
+                    List<Expression> projRefs = getTransformExpressions(writeSchema);
                     DATA_WRITER_LOG.info("projector: {}", projRefs);
                     this.projector = MutableProjection.create(
                             JavaConverters.asScalaBuffer(projRefs).toSeq());
@@ -380,11 +380,18 @@ public class VastWriteFactory
             executorService.submit(vastBgWriter);
         }
 
-        private List<Expression> getTransformExpressions()
+        private List<Expression> getTransformExpressions(StructType writeSchema)
         {
-            return IntStream.range(0, partitionIndices.size()).mapToObj(i -> {
-                int idx = partitionIndices.get(i);
-                StructField field = vastTableMetaData.schema.apply(idx);
+            List<String> writeColumns = Arrays.asList(writeSchema.names());
+            return IntStream.range(0, partitionColumns.size()).mapToObj(i -> {
+                int idx = writeColumns.indexOf(partitionColumns.get(i));
+                if (idx < 0) {
+                    throw new IllegalStateException(
+                            format("VastWriter%s: partition column %s is not in the write schema %s",
+                                    dataWriteTraceToken, partitionColumns.get(i),
+                                    writeColumns));
+                }
+                StructField field = writeSchema.apply(idx);
                 BoundReference br = new BoundReference(idx, field.dataType(),
                         field.nullable());
                 if (transformNames.get(i).startsWith("identity")) {
@@ -762,17 +769,24 @@ public class VastWriteFactory
                     currentRoot.close();
                     throw re;
                 }
+                // from here on the chunk belongs to the queue and to the background
+                // writer, which closes it once written: close() must not touch it while
+                // it is in flight (flushQueues() closes the contexts it steals from)
+                VectorSchemaRoot chunk = currentRoot;
+                currentRoot = null;
+                arrowWriter = null;
+                VectorSchemaRoot adapted = null;
                 try {
                     DATA_WRITER_LOG.info(
                             "VastWriter{}: Submitting next chunk of {} rows, hash={}: {} ({}, {})",
-                            dataWriteTraceToken, currentRoot.getRowCount(),
-                            currentRoot.hashCode(), currentRoot.getSchema(),
+                            dataWriteTraceToken, chunk.getRowCount(),
+                            chunk.hashCode(), chunk.getSchema(),
                             ctr, chunkSize);
-                    insertArrowVectorsQ.accept(
-                            writeModeAdaptor.apply(currentRoot));
+                    adapted = writeModeAdaptor.apply(chunk);
+                    insertArrowVectorsQ.accept(adapted);
                 }
                 catch (Throwable any) {
-                    currentRoot.close();
+                    (adapted != null ? adapted : chunk).close();
                     throw any;
                 }
             }
