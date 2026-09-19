@@ -218,6 +218,18 @@ public class VastWriteFactory
         };
     }
 
+    // the partition id of a 128-bit row id, its high 64 bits (the Int128 layout the
+    // predicate serializer sends the server)
+    private static Long rowIdPartition(InternalRow row)
+    {
+        return row
+                .getDecimal(0, 38, 0)
+                .toJavaBigDecimal()
+                .toBigInteger()
+                .shiftRight(64)
+                .longValue();
+    }
+
     private static Callable<Void> atMostOnce(Callable<Void> action)
     {
         AtomicBoolean done = new AtomicBoolean(false);
@@ -263,8 +275,14 @@ public class VastWriteFactory
         private final UnaryOperator<VectorSchemaRoot> writeModeAdaptor;
         private final int chunkSize;
         private final QueueCtx defaultCtx;
-        private final java.util.Map<InternalRow, QueueCtx> partitionedCtxs;
-        private final MutableProjection projector;
+        // one context per partition of the table when the rows are grouped, see partitionKey
+        private final java.util.Map<Object, QueueCtx> partitionedCtxs;
+        // the partition a row belongs to, null when every row goes to defaultCtx: for inserts
+        // the partition transforms over the row, for deletes and updates with a 128-bit row id
+        // (partitioned and sorted tables) the partition id the row id carries in its high 64
+        // bits, so that a DeleteRows/UpdateRows request holds the rows of one partition, as
+        // the Trino connector sends them
+        private final Function<InternalRow, Object> partitionKey;
         private final VastWriteMode mode;
         private Status status;
 
@@ -300,11 +318,18 @@ public class VastWriteFactory
                 DATA_WRITER_LOG.info(
                         "VastWriter{}: DELETE chunkSize = {}, writeSchema = {}",
                         dataWriteTraceToken, chunkSize, tableArrowSchema);
-                this.defaultCtx = new QueueCtx(
-                        InternalRowsQFactory.forDelete(chunkSize,
-                                complexRowID));
-                this.partitionedCtxs = null;
-                this.projector = null;
+                if (complexRowID) {
+                    this.defaultCtx = null;
+                    this.partitionedCtxs = new HashMap<>();
+                    this.partitionKey = VastWriteFactory::rowIdPartition;
+                }
+                else {
+                    this.defaultCtx = new QueueCtx(
+                            InternalRowsQFactory.forDelete(chunkSize,
+                                    complexRowID));
+                    this.partitionedCtxs = null;
+                    this.partitionKey = null;
+                }
             }
             else if (mode == VastWriteMode.UPDATE) {
                 this.chunkSize = vastConfig.getMaxRowsPerUpdate();
@@ -328,11 +353,18 @@ public class VastWriteFactory
                 DATA_WRITER_LOG.info(
                         "VastWriter{}: UPDATE chunkSize = {}, tableArrowSchema = {}",
                         dataWriteTraceToken, chunkSize, this.tableArrowSchema);
-                this.defaultCtx = new QueueCtx(
-                        InternalRowsQFactory.forUpdate(chunkSize,
-                                complexRowID));
-                this.partitionedCtxs = null;
-                this.projector = null;
+                if (complexRowID) {
+                    this.defaultCtx = null;
+                    this.partitionedCtxs = new HashMap<>();
+                    this.partitionKey = VastWriteFactory::rowIdPartition;
+                }
+                else {
+                    this.defaultCtx = new QueueCtx(
+                            InternalRowsQFactory.forUpdate(chunkSize,
+                                    complexRowID));
+                    this.partitionedCtxs = null;
+                    this.partitionKey = null;
+                }
             }
             else {
                 this.chunkSize = vastConfig.getMaxRowsPerInsert();
@@ -351,16 +383,17 @@ public class VastWriteFactory
                     List<org.apache.spark.sql.catalyst.expressions.Expression> projRefs = getTransformExpressions(
                             writeSchema);
                     DATA_WRITER_LOG.info("projector: {}", projRefs);
-                    this.projector = MutableProjection.create(
+                    MutableProjection projector = MutableProjection.create(
                             JavaConverters.asScalaBuffer(projRefs).toSeq());
                     this.partitionedCtxs = new HashMap<>();
                     this.defaultCtx = null;
+                    this.partitionKey = r -> projector.apply(r).copy();
                 }
                 else {
                     this.defaultCtx = new QueueCtx(
                             InternalRowsQFactory.forInsert(chunkSize));
                     this.partitionedCtxs = null;
-                    this.projector = null;
+                    this.partitionKey = null;
                 }
             }
             int ordinal = ordinal();
@@ -512,9 +545,8 @@ public class VastWriteFactory
             if (defaultCtx != null) {
                 return defaultCtx;
             }
-            InternalRow ir = projector.apply(r);
-            return partitionedCtxs.computeIfAbsent(ir.copy(),
-                    tr -> new QueueCtx(createRowsQueue()));
+            return partitionedCtxs.computeIfAbsent(partitionKey.apply(r),
+                    key -> new QueueCtx(createRowsQueue()));
         }
 
         private Queue<InternalRow> createRowsQueue()
@@ -584,10 +616,21 @@ public class VastWriteFactory
 
         private void flushQueues()
         {
-            QueueCtx tmp = new QueueCtx(createRowsQueue());
-            partitionedCtxs.values().forEach(tmp::steal);
+            if (mode == VastWriteMode.INSERT) {
+                // inserted rows of several partitions may share a request: gather the
+                // remainders of all contexts into one
+                QueueCtx tmp = new QueueCtx(createRowsQueue());
+                partitionedCtxs.values().forEach(tmp::steal);
+                tmp.commit();
+            }
+            else {
+                // a delete or update request carries the rows of one partition only
+                partitionedCtxs.values().forEach(ctx -> {
+                    ctx.commit();
+                    ctx.close();
+                });
+            }
             partitionedCtxs.clear();
-            tmp.commit();
         }
 
         @Override
@@ -605,8 +648,10 @@ public class VastWriteFactory
         public WriterCommitMessage commit()
                 throws IOException
         {
+            // counted before the flush, which retires the partition contexts
+            int rows = getCtr();
             DATA_WRITER_LOG.info("VastWriter{} commit(), ctr = {}",
-                    dataWriteTraceToken, getCtr());
+                    dataWriteTraceToken, rows);
             this.bgTaskPhasesCompletionListener.assertFailure();
             if (partitionedCtxs != null) {
                 flushQueues();
@@ -628,7 +673,7 @@ public class VastWriteFactory
             terminateBackgroundProcesses();
             return new VastCommitMessage(
                     new WriteCommitInfo(dataWriterIndex, dataWriteTraceToken,
-                            getCtr()).toString());
+                            rows).toString());
         }
 
         @Override

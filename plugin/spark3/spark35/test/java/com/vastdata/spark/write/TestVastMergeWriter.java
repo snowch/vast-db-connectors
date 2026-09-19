@@ -45,12 +45,14 @@ import spark.sql.catalog.ndb.BoundBucketFunction;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -97,9 +99,11 @@ public class TestVastMergeWriter
         final List<Object> firstColumn;
         // the values of the partition key column k, empty when the request does not carry it
         final List<Object> keys;
+        // the partition ids of the 128-bit row ids in the first column, empty otherwise
+        final List<Object> partitions;
 
         Rpc(String kind, String path, org.apache.arrow.vector.types.pojo.Schema schema,
-                int rows, List<Object> firstColumn, List<Object> keys)
+                int rows, List<Object> firstColumn, List<Object> keys, List<Object> partitions)
         {
             this.kind = kind;
             this.path = path;
@@ -110,12 +114,13 @@ public class TestVastMergeWriter
             this.rows = rows;
             this.firstColumn = firstColumn;
             this.keys = keys;
+            this.partitions = partitions;
         }
 
         @Override
         public String toString()
         {
-            return kind + path + fields + types + "x" + rows + firstColumn + " k=" + keys;
+            return kind + path + fields + types + "x" + rows + firstColumn + " k=" + keys + " p=" + partitions;
         }
     }
 
@@ -124,6 +129,28 @@ public class TestVastMergeWriter
     private List<Rpc> rpcs;
     private AtomicInteger rollbacks;
 
+    // 128-bit row ids carry the partition id in their high 64 bits and the row in the low ones
+    private static Decimal rowId(long partition, long row)
+    {
+        return Decimal.apply(new BigDecimal(BigInteger
+                .valueOf(partition)
+                .shiftLeft(64)
+                .add(BigInteger.valueOf(row))));
+    }
+
+    private static List<Object> rowIdPartitions(VectorSchemaRoot root)
+    {
+        List<Object> partitions = new ArrayList<>();
+        if (root.getVector(0) instanceof DecimalVector) {
+            DecimalVector vector = (DecimalVector) root.getVector(0);
+            for (int i = 0; i < root.getRowCount(); i++) {
+                partitions.add(vector.getObject(i).toBigInteger().shiftRight(64).longValue());
+            }
+        }
+        return partitions;
+    }
+
+    // firstColumnValues() reads the low 64 bits of a 128-bit row id: the row within its partition
     private static List<Object> firstColumnValues(VectorSchemaRoot root)
     {
         FieldVector vector = root.getVector(0);
@@ -209,7 +236,7 @@ public class TestVastMergeWriter
             rpcs.add(new Rpc("delete",
                     "/" + invocation.getArgument(1) + "/" + invocation.getArgument(2),
                     root.getSchema(), root.getRowCount(), firstColumnValues(root),
-                    keyValues(root)));
+                    keyValues(root), rowIdPartitions(root)));
             return null;
         }).when(client).deleteRows(any(), anyString(), anyString(),
                 any(VectorSchemaRoot.class), any(URI.class), any(),
@@ -219,7 +246,7 @@ public class TestVastMergeWriter
             rpcs.add(new Rpc("update",
                     "/" + invocation.getArgument(1) + "/" + invocation.getArgument(2),
                     root.getSchema(), root.getRowCount(), firstColumnValues(root),
-                    keyValues(root)));
+                    keyValues(root), rowIdPartitions(root)));
             return null;
         }).when(client).updateRows(any(), anyString(), anyString(),
                 any(VectorSchemaRoot.class), any(URI.class), any(),
@@ -272,23 +299,27 @@ public class TestVastMergeWriter
                 rows += root.getRowCount();
                 keys.addAll(keyValues(root));
             }
-            rpcs.add(new Rpc(kind, path, root.getSchema(), rows, List.of(), keys));
+            rpcs.add(new Rpc(kind, path, root.getSchema(), rows, List.of(), keys, List.of()));
             return rows;
         }
     }
 
     private VastWriteFactory mergeFactory(boolean sorted)
     {
-        return factory(mergeSchema(sorted ? SPARK_DEC128_ROW_ID_FIELD : SPARK_INT64_ROW_ID_FIELD),
+        VastTable table = table(mergeSchema(sorted ? SPARK_DEC128_ROW_ID_FIELD : SPARK_INT64_ROW_ID_FIELD),
                 new Transform[0],
-                sorted ? ImmutableMap.of(SORTED_BY_PROPERTY, "k") : Map.of(), true);
+                sorted ? ImmutableMap.of(SORTED_BY_PROPERTY, "k") : Map.of());
+        table.getTableMD().setForMerge();
+        return factory(table);
     }
 
     // a partitioned table carries the wide row id, like a sorted one
     private VastWriteFactory partitionedMergeFactory(Transform partitioning)
     {
-        return factory(mergeSchema(SPARK_DEC128_ROW_ID_FIELD), new Transform[] {partitioning},
-                Map.of(), true);
+        VastTable table = table(mergeSchema(SPARK_DEC128_ROW_ID_FIELD),
+                new Transform[] {partitioning}, Map.of());
+        table.getTableMD().setForMerge();
+        return factory(table);
     }
 
     // a plain INSERT writer: no row id in the rows and, as for every table the catalog builds,
@@ -298,7 +329,16 @@ public class TestVastMergeWriter
         StructType schema = new StructType(new StructField[] {
                 createStructField("k", DataTypes.IntegerType, true),
                 createStructField("v", DataTypes.StringType, true)});
-        return factory(schema, new Transform[0], Map.of(), false);
+        return factory(table(schema, new Transform[0], Map.of()));
+    }
+
+    // a plain DELETE writer on a partitioned table
+    private VastWriteFactory partitionedDeleteFactory()
+    {
+        VastTable table = table(mergeSchema(SPARK_DEC128_ROW_ID_FIELD),
+                new Transform[] {Expressions.identity("k")}, Map.of());
+        table.getTableMD().setForDelete();
+        return factory(table);
     }
 
     // MERGE reads the row id with the row: field 0 of the table schema
@@ -309,15 +349,15 @@ public class TestVastMergeWriter
                 createStructField("v", DataTypes.StringType, true)});
     }
 
-    private VastWriteFactory factory(StructType schema, Transform[] partitioning,
-            Map<String, String> properties, boolean merge)
+    private VastTable table(StructType schema, Transform[] partitioning,
+            Map<String, String> properties)
     {
-        VastTable table = new VastTable(null, SCHEMA_NAME, TABLE_NAME, "handle",
-                schema, partitioning, () -> client, false,
-                Optional.empty(), properties);
-        if (merge) {
-            table.getTableMD().setForMerge();
-        }
+        return new VastTable(null, SCHEMA_NAME, TABLE_NAME, "handle", schema, partitioning,
+                () -> client, false, Optional.empty(), properties);
+    }
+
+    private VastWriteFactory factory(VastTable table)
+    {
         VastConfig config = getTestConfig()
                 .setMaxRowsPerDelete(CHUNK_SIZE)
                 .setMaxRowsPerUpdate(CHUNK_SIZE)
@@ -354,6 +394,17 @@ public class TestVastMergeWriter
                 .filter(r -> (r.kind.equals("insert") || r.kind.equals("insert-update")) && !r.keys.isEmpty())
                 .map(r -> r.keys)
                 .collect(Collectors.toList()));
+    }
+
+    // one entry per delete or update request: the partition ids of its row ids, then the rows
+    // in request order; sorted, the order of the requests is not part of the contract
+    private List<String> rowIdRequests(String kind)
+    {
+        return rpcs(kind)
+                .stream()
+                .map(r -> new TreeSet<>(r.partitions) + ":" + r.firstColumn)
+                .sorted()
+                .collect(Collectors.toList());
     }
 
     private static List<String> chunks(List<? extends List<?>> keyChunks)
@@ -650,5 +701,64 @@ public class TestVastMergeWriter
         assertEquals(insertedKeyChunks(), chunks(List.of(List.of(1, 1), List.of(2, 2))),
                 "rpcs: " + rpcs);
         assertEquals(totalRows(rpcs("insert")), 4, "inserts: " + rpcs("insert"));
+    }
+
+    // On a partitioned table the deletes and updates of a merge are grouped by the partition
+    // their row id names, sorted within it, and never share a request across partitions, at
+    // commit included (the remainder of a partition is flushed on its own)
+    @Test
+    public void testDeletesAndUpdatesOnPartitionedTableGoOutPerPartition()
+            throws Exception
+    {
+        stubClient(RowIDStrategyType.DECIMAL_128);
+        DeltaWriter<InternalRow> writer = partitionedMergeFactory(
+                Expressions.identity("k")).createWriter(0, 7L);
+        writer.delete(null, row(rowId(1, 4)));
+        writer.update(null, row(rowId(2, 6)), row(rowId(2, 6), 2, UTF8String.fromString("f")));
+        writer.delete(null, row(rowId(2, 1)));
+        writer.update(null, row(rowId(1, 8)), row(rowId(1, 8), 1, UTF8String.fromString("h")));
+        writer.delete(null, row(rowId(1, 2)));
+        writer.update(null, row(rowId(2, 5)), row(rowId(2, 5), 2, UTF8String.fromString("e")));
+        writer.delete(null, row(rowId(2, 3)));
+        writer.update(null, row(rowId(1, 7)), row(rowId(1, 7), 1, UTF8String.fromString("g")));
+        writer.delete(null, row(rowId(1, 9)));
+        writer.insert(row(null, 3, UTF8String.fromString("i")));
+        WriterCommitMessage message = writer.commit();
+        writer.close();
+        assertEquals(rollbacks.get(), 0);
+        assertNotNull(message);
+
+        assertEquals(rowIdRequests("delete"),
+                List.of("[1]:[2, 4]", "[1]:[9]", "[2]:[1, 3]"), "deletes: " + rpcs("delete"));
+        assertEquals(rowIdRequests("update"),
+                List.of("[1]:[7, 8]", "[2]:[5, 6]"), "updates: " + rpcs("update"));
+        for (Rpc rpc : rpcs("delete")) {
+            assertEquals(rpc.fields, List.of(ROW_ID_FIELD_NAME), "delete: " + rpc);
+            assertEquals(rpc.types, List.of(new ArrowType.Decimal(38, 0, 128)), "delete: " + rpc);
+        }
+        for (Rpc rpc : rpcs("update")) {
+            assertEquals(rpc.fields, List.of(ROW_ID_FIELD_NAME, "k", "v"), "update: " + rpc);
+        }
+        assertEquals(totalRows(rpcs("insert")), 1, "inserts: " + rpcs("insert"));
+    }
+
+    // The same grouping serves a plain DELETE on a partitioned table
+    @Test
+    public void testPlainDeleteOnPartitionedTableGoesOutPerPartition()
+            throws Exception
+    {
+        stubClient(RowIDStrategyType.DECIMAL_128);
+        DeltaWriter<InternalRow> writer = partitionedDeleteFactory().createWriter(0, 7L);
+        writer.write(row(rowId(2, 1)));
+        writer.write(row(rowId(1, 4)));
+        writer.write(row(rowId(1, 2)));
+        writer.write(row(rowId(2, 3)));
+        writer.write(row(rowId(1, 9)));
+        WriterCommitMessage message = writer.commit();
+        writer.close();
+        assertEquals(rollbacks.get(), 0);
+        assertTrue(message.toString().contains("writtenRows=5"), "commit message: " + message);
+        assertEquals(rowIdRequests("delete"),
+                List.of("[1]:[2, 4]", "[1]:[9]", "[2]:[1, 3]"), "deletes: " + rpcs("delete"));
     }
 }
